@@ -1,46 +1,76 @@
 # qwen3-tts-server
 
-OpenAI-compatible HTTP server for [**Qwen3-TTS-12Hz-1.7B-CustomVoice**](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) with **token-level PCM streaming**, **sentence chunking**, **emotion control**, and **bilingual** (English / French / Chinese / etc.) generation.
+OpenAI-compatible HTTP server for [**Qwen3-TTS-12Hz-1.7B-CustomVoice**](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) with **token-level PCM streaming**, **sentence chunking**, **emotion control**, and **bilingual** generation.
 
-Built for low-latency conversational voice agents — the first audio frame arrives in **~130 ms** on an RTX 4080 SUPER and the model generates speech at **~3× real-time**.
+Built for low-latency conversational voice agents — the first audio frame arrives in **~130 ms** on an RTX 4080 SUPER and the model generates speech at **~3–3.4× real-time**.
 
-> Companion project: [**qwen3-asr-server**](https://github.com/malaiwah/qwen3-asr-server) — the matching speech-to-text server. Together they form a complete voice loop: text → TTS → audio → ASR → text.
+> Companion project: [**qwen3-asr-server**](https://github.com/malaiwah/qwen3-asr-server) — the matching speech-to-text server.
 
 ---
 
 ## What you get
 
 - 🎙️ `/v1/audio/speech` — OpenAI-compatible single-shot synthesis (WAV/MP3/Opus)
+  - Accepts **JSON body** (`input` field) **or** query parameters — drop-in for OpenAI SDK
+  - OpenAI voice aliases (`alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`) mapped automatically
 - 📦 `/v1/audio/speech/stream` — sentence-chunked streaming (length-prefixed framing)
-- ⚡ `/v1/audio/speech/pcm-stream` — **token-level** PCM streaming (gap-free, ~130 ms first-chunk latency)
+- ⚡ `/v1/audio/speech/pcm-stream` — **token-level** PCM streaming (~130 ms first chunk)
 - 🎭 `instruct=` parameter for emotion/style control (`"Excited and speak quickly."`, `"Whisper softly."`)
 - 🗣️ 9 built-in voices (`ryan`, `aiden`, `dylan`, `eric`, `serena`, `vivian`, `sohee`, `ono_anna`, `uncle_fu`)
 - 🌍 Multilingual — English, French, German, Spanish, Italian, Portuguese, Japanese, Korean, Chinese
 - 🚦 Barge-in friendly — streams abort cleanly on client disconnect
-- 🐳 Single-container deploy with HuggingFace cache volume
-- 🐌 CPU fallback for smoke tests (no GPU? still usable)
+- 🐳 Docker/Podman — single-container deploy, Ubuntu 24.04, CUDA 12.8
+- 🐌 CPU fallback for smoke tests (`--cpu`)
+
+---
+
+## Performance tiers
+
+| Tier | Backend | Requirement | ~Real-time factor | First PCM chunk |
+|------|---------|-------------|-------------------|-----------------|
+| **1 (default)** | `faster-qwen3-tts` + CUDA graphs | `pip install faster-qwen3-tts` (in container by default) | **~3–3.4×** | **~130 ms** |
+| 2 | `qwen_tts` + flash_attention_2 | `pip install flash-attn` | ~2× | ~400 ms |
+| 3 | `qwen_tts` + SDPA | PyTorch 2.x built-in, no extra install | ~1.5× | ~500 ms |
+| CPU | transformers | no GPU required | ~0.01–0.05× | 30+ s |
+
+The server selects the best available tier at startup and logs which one it's using.
+The container image always installs `faster-qwen3-tts` (tier 1).
 
 ---
 
 ## Quickstart (Docker / Podman)
 
 ```bash
-# 1. Run the container — mount a volume for the HF model cache (~3 GB once cached)
-podman run -d --name qwen3-tts \
-  --device nvidia.com/gpu=all \
+# 1. Run the container — mount a volume for the HF model cache (~3 GB on first run)
+docker run -d --name qwen3-tts \
+  --gpus all \
   -p 8001:8001 \
   -v qwen3-hf-cache:/root/.cache/huggingface \
   ghcr.io/malaiwah/qwen3-tts-server:latest
 
-# (Optional) supply a HuggingFace token if you've gated your downloads
+# Podman equivalent:
+# podman run -d --name qwen3-tts \
+#   --device nvidia.com/gpu=all \
+#   -p 8001:8001 \
+#   -v qwen3-hf-cache:/root/.cache/huggingface \
+#   ghcr.io/malaiwah/qwen3-tts-server:latest
+
+# (Optional) pass a HuggingFace token if needed
 #   -e HF_TOKEN=hf_xxx
 
-# 2. Wait for the model to load (first run downloads ~3 GB; subsequent runs reuse the volume)
-podman logs -f qwen3-tts   # look for "CUDA graph warmup done"
+# 2. Wait for the model to load (first run downloads ~3 GB; subsequent runs reuse volume)
+docker logs -f qwen3-tts   # look for "✓ Server ready — backend: faster-qwen3-tts"
 
-# 3. Try it
-curl -X POST "http://localhost:8001/v1/audio/speech?text=Hello+from+Qwen3&voice=ryan" -o hello.mp3
-mpv hello.mp3   # or any audio player
+# 3. Try it — using OpenAI-compatible JSON body
+curl -s -X POST http://localhost:8001/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model":"tts-1","input":"Hello from Qwen3","voice":"alloy"}' \
+  -o hello.mp3
+mpv hello.mp3
+
+# Or query-parameter style (also supported):
+curl -s -X POST "http://localhost:8001/v1/audio/speech?text=Hello+from+Qwen3&voice=ryan" \
+  -o hello.mp3
 ```
 
 ---
@@ -51,8 +81,16 @@ mpv hello.mp3   # or any audio player
 git clone https://github.com/malaiwah/qwen3-tts-server.git
 cd qwen3-tts-server
 uv venv && source .venv/bin/activate
-uv pip install -e ".[gpu]"            # add ",test" to also install pytest
-python server.py                       # add --cpu to run on CPU (slow)
+
+# GPU (tier 1 — fastest, ~3.4× real-time):
+uv pip install torch --index-url https://download.pytorch.org/whl/cu128  # match your CUDA
+uv pip install -e ".[gpu]"   # installs faster-qwen3-tts
+python server.py              # starts on :8001
+
+# CPU fallback (very slow, smoke tests only):
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install -e "."
+python server.py --cpu
 
 # In another shell:
 ./test-tts.py "Hello from Qwen3"                              # writes out.mp3
@@ -62,9 +100,31 @@ python server.py                       # add --cpu to run on CPU (slow)
 
 ---
 
-## Round-trip with qwen3-asr-server
+## OpenAI SDK drop-in
 
-The two servers compose naturally — generate speech with one, transcribe it with the other to verify both:
+The server accepts the exact JSON body format the OpenAI Python SDK sends:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="not-needed",
+    base_url="http://localhost:8001/v1",
+)
+
+# OpenAI voice aliases are remapped automatically:
+# alloy→ryan, echo→aiden, fable→dylan, onyx→eric, nova→serena, shimmer→vivian
+response = client.audio.speech.create(
+    model="tts-1",
+    voice="alloy",
+    input="The quick brown fox jumps over the lazy dog.",
+)
+response.stream_to_file("output.mp3")
+```
+
+---
+
+## Round-trip with qwen3-asr-server
 
 ```mermaid
 flowchart LR
@@ -83,11 +143,20 @@ flowchart LR
 ./test-asr.py sample.wav   # see github.com/malaiwah/qwen3-asr-server
 ```
 
+To run both services together with automatic GPU sharing and startup ordering:
+
+```bash
+# Clone either repo or save the docker-compose.yml, then:
+HF_TOKEN=hf_xxx docker compose up -d
+```
+
+See [`docker-compose.yml`](docker-compose.yml) for the full configuration including VRAM budget notes.
+
 ---
 
 ## Hardware reference (tested)
 
-The numbers below come from a single GPU host nicknamed **Creativity**:
+### Primary (benchmarks below)
 
 | Component | Spec |
 |---|---|
@@ -95,19 +164,36 @@ The numbers below come from a single GPU host nicknamed **Creativity**:
 | **CPU** | Intel Core i7-14700 KF (20 cores / 28 threads) |
 | **RAM** | 32 GB DDR5 |
 | **OS** | Ubuntu 24.04.4 LTS |
-| **Driver** | NVIDIA 595.58.03 (CUDA 13.x) |
+| **Driver** | NVIDIA 595.58.03 (CUDA 13.x, driver-compat tier) |
 
-### Performance (sustained, real production traffic)
+### Also validated on
+
+| GPU | VRAM | Driver | CUDA compat | Notes |
+|-----|------|--------|-------------|-------|
+| NVIDIA GRID A100D-20C (Vultr vGPU) | 20 GB | 550.90.07 | ≤ 12.4 | Use `ghcr.io/.../qwen3-tts-server:cu124` |
+| CPU-only (no GPU) | — | — | — | `--cpu` flag; very slow |
+
+### Performance (RTX 4080 SUPER, tier-1 backend)
 
 | Workload | Length | Wall time | Real-time factor |
 |---|---|---|---|
-| First PCM chunk (320 ms audio) | 7 680 samples | **131 ms** | ~2.4× faster than RT |
-| Short reply (140 chars, ~9 s audio) | 27 chunks | 2.66 s | ~3.4× |
-| Medium reply (467 chars, ~40 s audio) | 126 chunks | 12.58 s | ~3.2× |
-| Long reply (1 019 chars, ~80 s audio) | 255 chunks | 25.47 s | ~3.2× |
+| First PCM chunk (320 ms audio) | 7 680 samples | **131 ms** | ~2.4× |
+| Short reply (~9 s audio) | 27 chunks | 2.66 s | ~3.4× |
+| Medium reply (~40 s audio) | 126 chunks | 12.58 s | ~3.2× |
+| Long reply (~80 s audio) | 255 chunks | 25.47 s | ~3.2× |
 
-VRAM footprint: **~4.4 GB** with `flash_attention_2` + bfloat16 + CUDA-graph warmup.
-Leaves room on a 16 GB card for a separate ASR model (see qwen3-asr-server).
+VRAM footprint: **~4.4 GB** (bfloat16 + CUDA-graph warmup).
+
+### Performance (GRID A100D-20C vGPU, tier-1 backend)
+
+The A100D-20C is a virtualised 20 GB slice of an A100 80 GB. The vGPU hypervisor
+adds overhead and the A100 is optimised for large-batch workloads, not single-stream
+inference — so per-request latency is higher than on a consumer card:
+
+| Workload | Wall time | Real-time factor |
+|---|---|---|
+| Short reply (~9 s audio) | ~6.4 s | ~1.4× |
+| First PCM chunk | ~300 ms | — |
 
 ---
 
@@ -115,19 +201,22 @@ Leaves room on a 16 GB card for a separate ASR model (see qwen3-asr-server).
 
 ### `POST /v1/audio/speech` — single-shot synthesis
 
+Accepts **JSON body** or **query parameters**.
+
 | Param | Default | Notes |
 |---|---|---|
-| `text` | *(required)* | UTF-8 text, any length (capped by client) |
-| `voice` | `ryan` | One of `GET /voices` |
-| `language` | `English` | `English`, `French`, `Chinese`, `German`, `Spanish`, ... |
+| `input` / `text` | *(required)* | Text to synthesise. `input` preferred (OpenAI SDK compat). |
+| `model` | `tts-1` | Accepted for OpenAI compat; always uses Qwen3-TTS-CustomVoice. |
+| `voice` | `ryan` | Speaker name or OpenAI alias. See `GET /voices`. |
+| `language` | `English` | `English`, `French`, `Chinese`, `German`, `Spanish`, … |
 | `instruct` | *(none)* | Style hint, e.g. `"Excited and speak quickly."` |
 | `response_format` | `mp3` | `mp3`, `wav`, or `opus` |
-
-Returns the audio bytes inline. Response headers include `X-Latency-Ms` and `X-Gen-Time-Ms`.
+| `speed` | `1.0` | Accepted for OpenAI compat; Qwen3-TTS does not support speed control. |
 
 ### `POST /v1/audio/speech/stream` — sentence-chunked
 
-Same parameters as above. Splits text on sentence boundaries (`.!?`) and streams one self-contained audio file per sentence using length-prefixed framing:
+Same parameters as above (JSON body or query params). Streams one self-contained audio file
+per sentence with length-prefixed framing:
 
 ```
 [4 bytes BE uint32: chunk_length][chunk_length bytes: audio]
@@ -135,18 +224,24 @@ Same parameters as above. Splits text on sentence boundaries (`.!?`) and streams
 ... (stream ends on socket close)
 ```
 
-### `POST /v1/audio/speech/pcm-stream` — token-level PCM (recommended for live agents)
+### `POST /v1/audio/speech/pcm-stream` — token-level PCM (tier-1 only)
 
-Yields raw 24 kHz mono int16 PCM frames as the model generates them — perceived latency ≈ 130 ms.
-A zero-length frame marks end of stream.  **Requires `faster-qwen3-tts`** (installed by default in the container).
+Yields raw **24 kHz mono int16 PCM** frames as the model generates them.
+First chunk latency ≈ **130 ms** on RTX 4080 SUPER.
+A zero-length frame marks end of stream.
+**Requires `faster-qwen3-tts`** (tier-1 backend — installed by default in the container).
 
 | Param | Default | Notes |
 |---|---|---|
 | `chunk_size` | `4` | Codec frames per yield (lower = lower latency, more overhead) |
 
-### `GET /voices`, `GET /v1/models`, `GET /health`
+### `GET /voices` — available speakers
 
-Standard introspection endpoints.
+Returns all supported speaker names plus the OpenAI alias mapping.
+
+### `GET /health`, `GET /v1/models`
+
+Standard introspection endpoints.  `/health` includes the active backend tier.
 
 ---
 
@@ -154,17 +249,18 @@ Standard introspection endpoints.
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `QWEN3_TTS_MODEL_ID` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | Override the HF model (must be Qwen3-TTS-compatible) |
+| `QWEN3_TTS_MODEL_ID` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | Override the HF model |
+| `QWEN3_TTS_MAX_TEXT_LENGTH` | `10000` | Maximum input characters (returns HTTP 413 if exceeded) |
 | `HF_HOME` | `/root/.cache/huggingface` | Where weights are cached. **Mount a volume here.** |
-| `HF_TOKEN` | *(unset)* | Optional — only needed if you've gated downloads on your account |
+| `HF_TOKEN` | *(unset)* | HuggingFace token for gated downloads |
 
-CLI flags (when running `server.py` directly):
+CLI flags:
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8001` | Listen port |
-| `--cpu` | *(off)* | Run on CPU. **Slow.** Forced on if no CUDA device is detected. |
+| `--cpu` | *(off)* | Force CPU mode. **Very slow.** |
 | `--log-level` | `info` | Uvicorn log level |
 
 ---
@@ -172,18 +268,19 @@ CLI flags (when running `server.py` directly):
 ## Building from source
 
 ```bash
+docker build -t qwen3-tts-server:latest -f Containerfile .
+# or
 podman build -t qwen3-tts-server:latest -f Containerfile .
 ```
 
-The CI workflow in `.github/workflows/build.yml` builds and pushes
-to `ghcr.io/<owner>/qwen3-tts-server:latest` on every push to `main`
-plus version tags (`v0.1.0`, `v0.1`, `latest`).
+The CI workflow builds and pushes to `ghcr.io/malaiwah/qwen3-tts-server:latest`
+on every push to `main` and version tags (`v0.1.0`, etc.).
 
 ---
 
 ## Tests
 
-Smoke tests run without a model load and are GPU-free, so they fit in CI:
+Smoke tests run without a GPU or model load and are CI-safe:
 
 ```bash
 uv pip install -e ".[test]"
@@ -192,14 +289,12 @@ pytest -q
 
 ---
 
-## CPU mode warning
+## CPU mode
 
-CPU inference works but is **orders of magnitude slower** — generation can be 30 s+ per short sentence. Use it only for:
-- environments without an NVIDIA GPU
-- smoke tests / CI
-- demonstrating the API surface
+CPU inference is **orders of magnitude slower** — 30 s+ per short sentence.
+Use it only for smoke tests, API surface exploration, or environments without a GPU.
 
-For real conversational use, a CUDA GPU with ≥ 6 GB VRAM is strongly recommended.
+For conversational use, a CUDA GPU with ≥ 6 GB VRAM is required.
 
 ---
 
