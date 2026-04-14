@@ -200,6 +200,7 @@ See [`docker-compose.yml`](docker-compose.yml) for the full configuration includ
 
 | GPU | VRAM | Driver | CUDA compat | Notes |
 |-----|------|--------|-------------|-------|
+| NVIDIA GeForce RTX 5090 (Vast.ai VM) | 32 GB | 580.95.05 / 595.58.03 | 13.0 / 13.2 | Tier-1; ~19 ms/step, ~4.5× RTF — see two-pass results below |
 | NVIDIA GeForce RTX 4090 (Vast.ai VM) | 24 GB | 580.126.09 | 13.0 | Tier-1; ~19 ms/step, ~4.2× RTF |
 | NVIDIA GRID A100D-20C (Vultr vGPU) | 20 GB | 550.90.07 | ≤ 12.4 | cu128 image works fine; driver locks at 550 |
 | CPU-only (no GPU) | — | — | — | `--cpu` flag; very slow |
@@ -230,6 +231,23 @@ consumer card despite the HBM2e memory:
 | First PCM chunk | 320 ms | **~350 ms** | — | — |
 
 VRAM footprint: **~14.4 GB** when co-located with the ASR vLLM server (18.8 GB / 20 GB total).
+
+### Performance (RTX 5090, tier-1 backend — two-pass driver comparison)
+
+*Measured on Vast.ai NVIDIA GeForce RTX 5090 (32 GB VRAM, Blackwell sm_12.0),
+Ubuntu 22.04 VM, faster-qwen3-tts (CUDA graphs, tier 1) — steady-state (4 runs averaged per pass).*
+
+Two passes were run on the same machine to isolate the effect of a driver upgrade:
+
+| Pass | Driver | CUDA compat | Short (~3s) wall | Short RTF | Medium (~12s) wall | Medium RTF | Long (~30s) wall | Long RTF | PCM first chunk |
+|------|--------|-------------|-----------------|-----------|-------------------|------------|-----------------|----------|----------------|
+| 1 (stock) | 580.95.05 | 13.0 | 0.78 s | **4.34×** | 2.80 s | **4.53×** | 6.70 s | **4.57×** | **178 ms** |
+| 2 (upgraded) | 595.58.03 | 13.2 | 0.81 s | **4.39×** | 2.73 s | **4.56×** | 6.73 s | **4.59×** | **177 ms** |
+
+**TTS performance is identical across both driver versions** — within measurement noise.
+The faster-qwen3-tts tier-1 backend is insensitive to the driver bump on this GPU.
+
+VRAM footprint: **~4.4 GB** TTS alone; **~28 GB** when co-located with ASR (both models on one RTX 5090).
 
 ### Performance (RTX 4090, tier-1 backend)
 
