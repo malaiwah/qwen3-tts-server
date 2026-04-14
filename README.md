@@ -38,6 +38,36 @@ The container image always installs `faster-qwen3-tts` (tier 1).
 
 ---
 
+## Host prerequisites (GPU)
+
+Before running the container, install the NVIDIA driver and container toolkit on the host.
+
+```bash
+# --- NVIDIA driver (Ubuntu 24.04, from the official CUDA repo) ---
+# Open kernel module — recommended for Turing, Ampere, Ada Lovelace, Blackwell
+curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/3bf863cc.pub \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/nvidia-cuda.gpg
+printf 'Types: deb\nURIs: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/\nSuites: /\nSigned-By: /etc/apt/keyrings/nvidia-cuda.gpg\n' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-cuda.sources
+sudo apt-get update
+sudo apt-get install -y nvidia-driver-open nvidia-container-toolkit
+
+# For Docker — configure runtime and restart
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+
+# For Podman — generate CDI specs (enables --device nvidia.com/gpu=all)
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+
+# Verify
+nvidia-smi
+```
+
+> **Driver note**: `nvidia-driver-open` uses the open kernel module and works on Turing+.
+> For Pascal and older GPUs use the proprietary variant (`nvidia-driver-XXX`).
+
+---
+
 ## Quickstart (Docker / Podman)
 
 ```bash
@@ -48,14 +78,14 @@ docker run -d --name qwen3-tts \
   -v qwen3-hf-cache:/root/.cache/huggingface \
   ghcr.io/malaiwah/qwen3-tts-server:latest
 
-# Podman equivalent:
+# Podman equivalent (requires CDI — see Host prerequisites above):
 # podman run -d --name qwen3-tts \
 #   --device nvidia.com/gpu=all \
 #   -p 8001:8001 \
 #   -v qwen3-hf-cache:/root/.cache/huggingface \
 #   ghcr.io/malaiwah/qwen3-tts-server:latest
 
-# (Optional) pass a HuggingFace token if needed
+# (Optional) pass a HuggingFace token if needed:
 #   -e HF_TOKEN=hf_xxx
 
 # 2. Wait for the model to load (first run downloads ~3 GB; subsequent runs reuse volume)
