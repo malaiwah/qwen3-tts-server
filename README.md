@@ -200,6 +200,7 @@ See [`docker-compose.yml`](docker-compose.yml) for the full configuration includ
 
 | GPU | VRAM | Driver | CUDA compat | Notes |
 |-----|------|--------|-------------|-------|
+| NVIDIA GeForce RTX 4090 (Vast.ai VM) | 24 GB | 580.126.09 | 13.0 | Tier-1; ~19 ms/step, ~4.2× RTF |
 | NVIDIA GRID A100D-20C (Vultr vGPU) | 20 GB | 550.90.07 | ≤ 12.4 | cu128 image works fine; driver locks at 550 |
 | CPU-only (no GPU) | — | — | — | `--cpu` flag; very slow |
 
@@ -229,6 +230,22 @@ consumer card despite the HBM2e memory:
 | First PCM chunk | 320 ms | **~350 ms** | — | — |
 
 VRAM footprint: **~14.4 GB** when co-located with the ASR vLLM server (18.8 GB / 20 GB total).
+
+### Performance (RTX 4090, tier-1 backend)
+
+*Measured on Vast.ai NVIDIA GeForce RTX 4090 (24 GB VRAM), driver 580.126.09, CUDA 13.0,
+Ubuntu 22.04 VM, faster-qwen3-tts (CUDA graphs, tier 1) — steady-state (warm model, 4 runs averaged).*
+
+| Workload | Audio | Wall time | Real-time factor | Step time |
+|---|---|---|---|---|
+| Short sentence (~3.1 s) | ~3.1 s | **0.74 s** | ~4.2× | **~19 ms/step** |
+| Longer sentence (~8.8 s) | ~8.8 s | **2.04 s** | ~4.3× | ~19 ms/step |
+
+VRAM footprint: **~4.4 GB** (same as RTX 4080 SUPER).
+
+The RTX 4090's larger SM count and higher memory bandwidth deliver ~0.5–1× faster RTF and
+~10 ms/step lower latency compared with the RTX 4080 SUPER, while the VRAM footprint is
+identical — leaving ~19 GB free for co-located workloads.
 
 ---
 
