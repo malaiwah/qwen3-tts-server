@@ -200,7 +200,7 @@ See [`docker-compose.yml`](docker-compose.yml) for the full configuration includ
 
 | GPU | VRAM | Driver | CUDA compat | Notes |
 |-----|------|--------|-------------|-------|
-| NVIDIA GRID A100D-20C (Vultr vGPU) | 20 GB | 550.90.07 | ≤ 12.4 | Use `ghcr.io/.../qwen3-tts-server:cu124` |
+| NVIDIA GRID A100D-20C (Vultr vGPU) | 20 GB | 550.90.07 | ≤ 12.4 | cu128 image works fine; driver locks at 550 |
 | CPU-only (no GPU) | — | — | — | `--cpu` flag; very slow |
 
 ### Performance (RTX 4080 SUPER, tier-1 backend)
@@ -216,14 +216,19 @@ VRAM footprint: **~4.4 GB** (bfloat16 + CUDA-graph warmup).
 
 ### Performance (GRID A100D-20C vGPU, tier-1 backend)
 
-The A100D-20C is a virtualised 20 GB slice of an A100 80 GB. The vGPU hypervisor
-adds overhead and the A100 is optimised for large-batch workloads, not single-stream
-inference — so per-request latency is higher than on a consumer card:
+*Measured on Vultr GRID A100D-20C (20 GB vGPU), driver 550.90.07, CUDA 12.4,
+cu128 container, faster-qwen3-tts (CUDA graphs, tier 1).*
 
-| Workload | Wall time | Real-time factor |
-|---|---|---|
-| Short reply (~9 s audio) | ~6.4 s | ~1.4× |
-| First PCM chunk | ~300 ms | — |
+The A100D-20C is a virtualised 20 GB slice of an A100 80 GB. The vGPU hypervisor
+allocates ≈25% of the compute budget, so single-stream inference is slower than a
+consumer card despite the HBM2e memory:
+
+| Workload | Audio | Wall time | Real-time factor | Step time |
+|---|---|---|---|---|
+| Short sentence (9 words) | ~3 s | ~2.3 s | ~1.4× | ~57 ms/step |
+| First PCM chunk | 320 ms | **~350 ms** | — | — |
+
+VRAM footprint: **~14.4 GB** when co-located with the ASR vLLM server (18.8 GB / 20 GB total).
 
 ---
 
