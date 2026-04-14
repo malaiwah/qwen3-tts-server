@@ -42,7 +42,7 @@ import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 
@@ -52,6 +52,15 @@ from pydantic import BaseModel, Field
 
 MODEL_ID = os.getenv("QWEN3_TTS_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
 MAX_TEXT_LENGTH = int(os.getenv("QWEN3_TTS_MAX_TEXT_LENGTH", "10000"))
+
+# Optional bearer-token auth.  Empty/None disables auth entirely.
+_API_KEY: str = os.getenv("QWEN_API_KEY", "") or ""
+
+# Paths exempt from auth (standard ops endpoints + OpenAPI docs).
+_AUTH_EXEMPT_PATHS = frozenset({
+    "/", "/health", "/metrics",
+    "/docs", "/redoc", "/openapi.json",
+})
 
 # OpenAI voice aliases → Qwen3 speaker names
 # Unknown voices are passed through unchanged (allows custom speakers).
@@ -172,22 +181,130 @@ def _load_model_sync(device: str, prefer_faster: bool) -> None:
     logger.info("✓ Server ready — backend: %s", backend_desc)
 
 
+# -----------------------------------------------------------------------
+# Prometheus metrics (in-process, no external deps beyond prometheus_client)
+# -----------------------------------------------------------------------
+
+try:
+    from prometheus_client import (
+        CONTENT_TYPE_LATEST,
+        Counter,
+        Gauge,
+        Histogram,
+        generate_latest,
+    )
+    _METRICS_AVAILABLE = True
+except ImportError:  # pragma: no cover — prometheus_client is a hard dep in prod
+    _METRICS_AVAILABLE = False
+
+if _METRICS_AVAILABLE:
+    _M_REQUESTS = Counter(
+        "qwen3_tts_requests_total",
+        "Total HTTP requests handled by qwen3-tts-server.",
+        ["method", "path", "status"],
+    )
+    _M_LATENCY = Histogram(
+        "qwen3_tts_request_duration_seconds",
+        "HTTP request latency (wall clock, seconds).",
+        ["method", "path"],
+        buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0),
+    )
+    _M_INFLIGHT = Gauge(
+        "qwen3_tts_requests_in_flight",
+        "HTTP requests currently being processed.",
+    )
+    _M_MODEL_READY = Gauge(
+        "qwen3_tts_model_ready",
+        "1 if the model is loaded and ready to serve, else 0.",
+    )
+    _M_BACKEND_INFO = Gauge(
+        "qwen3_tts_backend_info",
+        "Backend descriptor (value is always 1; dimensions in labels).",
+        ["device", "backend", "model_id"],
+    )
+
+
+def _route_template(request: Request) -> str:
+    """Return the registered route template for a request (low-cardinality label)."""
+    route = request.scope.get("route")
+    if route is not None and hasattr(route, "path"):
+        return route.path
+    return request.url.path
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _INFER_SEM
     # One inference at a time: CUDA-graph captures are not re-entrant.
     _INFER_SEM = asyncio.Semaphore(1)
+    if _METRICS_AVAILABLE:
+        _M_MODEL_READY.set(0)
     # Load model off the event loop so uvicorn stays responsive.
     await asyncio.to_thread(_load_model_sync, _DEVICE, _DEVICE == "cuda")
+    if _METRICS_AVAILABLE:
+        backend = "faster-qwen3-tts" if _FASTER_TTS else "qwen_tts"
+        _M_BACKEND_INFO.labels(device=_DEVICE, backend=backend, model_id=MODEL_ID).set(1)
+        _M_MODEL_READY.set(1 if _model_ready else 0)
     yield
     # Cleanup on shutdown (releases GPU memory for clean container stop).
     global _model
     _model = None
+    if _METRICS_AVAILABLE:
+        _M_MODEL_READY.set(0)
     if _DEVICE == "cuda":
         torch.cuda.empty_cache()
 
 
 app = FastAPI(title="Qwen3-TTS CustomVoice", lifespan=lifespan)
+
+
+# -----------------------------------------------------------------------
+# Auth + metrics middleware
+# -----------------------------------------------------------------------
+
+@app.middleware("http")
+async def _auth_and_metrics(request: Request, call_next):
+    path = request.url.path
+
+    # Bearer-token auth (enabled when QWEN_API_KEY / --api-key is set).
+    if _API_KEY and path not in _AUTH_EXEMPT_PATHS:
+        auth = request.headers.get("authorization", "")
+        expected = f"Bearer {_API_KEY}"
+        if auth != expected:
+            return JSONResponse(
+                {"error": {"message": "Invalid or missing API key.", "type": "invalid_request_error", "code": "invalid_api_key"}},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    if not _METRICS_AVAILABLE:
+        return await call_next(request)
+
+    t0 = time.perf_counter()
+    _M_INFLIGHT.inc()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        _M_INFLIGHT.dec()
+        template = _route_template(request)
+        elapsed = time.perf_counter() - t0
+        _M_LATENCY.labels(method=request.method, path=template).observe(elapsed)
+        _M_REQUESTS.labels(method=request.method, path=template, status=str(status_code)).inc()
+
+
+@app.get("/metrics")
+async def metrics_endpoint() -> Response:
+    """Prometheus exposition endpoint.  Not authenticated (standard ops practice)."""
+    if not _METRICS_AVAILABLE:
+        return PlainTextResponse(
+            "# prometheus_client not installed\n",
+            status_code=501,
+        )
+    _M_MODEL_READY.set(1 if _model_ready else 0)
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 # -----------------------------------------------------------------------
@@ -623,10 +740,22 @@ Tier is selected automatically based on what is installed.
         action="store_true",
         help="Force CPU mode. WARNING: orders of magnitude slower; for smoke tests only.",
     )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Require 'Authorization: Bearer <key>' on /v1/* endpoints. "
+             "Overrides the QWEN_API_KEY env var when provided. "
+             "/health and /metrics remain unauthenticated.",
+    )
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args()
 
-    global _DEVICE
+    global _DEVICE, _API_KEY
+    if args.api_key is not None:
+        _API_KEY = args.api_key
+    if _API_KEY:
+        logger.info("API-key auth enabled — /v1/* endpoints require 'Authorization: Bearer <key>'.")
+
     if args.cpu or not torch.cuda.is_available():
         if not args.cpu:
             logger.warning("No CUDA device detected; falling back to CPU. Performance will be very slow.")

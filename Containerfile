@@ -38,7 +38,7 @@ RUN pip install --no-cache-dir torch torchvision torchaudio \
 # TTS inference + serving stack
 # faster-qwen3-tts: tier-1 CUDA-graph-accelerated backend (~3.4x RT)
 # qwen-tts: reference backend (tier 2/3 fallback, also a dep of faster-qwen3-tts)
-RUN pip install --no-cache-dir faster-qwen3-tts qwen-tts soundfile fastapi uvicorn
+RUN pip install --no-cache-dir faster-qwen3-tts qwen-tts soundfile fastapi uvicorn prometheus-client
 
 # Flash Attention 2 (optional — tier-2 speedup for the qwen_tts fallback path).
 # Only installs a pre-built binary wheel; never compiles from source so CI stays fast.

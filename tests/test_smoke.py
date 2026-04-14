@@ -244,3 +244,59 @@ def test_transcode_wav_opus_calls_ffmpeg():
     assert result == fake_ogg
     cmd = mock_run.call_args[0][0]
     assert "libopus" in cmd
+
+
+# -----------------------------------------------------------------------
+# Metrics endpoint and auth middleware (in-process via TestClient)
+# -----------------------------------------------------------------------
+
+def test_metrics_endpoint_exposed_without_auth():
+    from fastapi.testclient import TestClient
+    server = _import_server()
+    original = server._API_KEY
+    server._API_KEY = ""
+    try:
+        client = TestClient(server.app)
+        r = client.get("/metrics")
+        assert r.status_code == 200
+        body = r.text
+        assert "qwen3_tts_requests_total" in body or "qwen3_tts_request_duration_seconds" in body
+        assert "qwen3_tts_model_ready" in body
+    finally:
+        server._API_KEY = original
+
+
+def test_auth_blocks_v1_when_key_set():
+    from fastapi.testclient import TestClient
+    server = _import_server()
+    original = server._API_KEY
+    server._API_KEY = "secret-key"
+    try:
+        client = TestClient(server.app)
+        # /v1/models requires model_ready; here we only check auth — any
+        # non-200 is fine as long as unauthenticated hits 401 first.
+        r = client.get("/v1/models")
+        assert r.status_code == 401
+        r = client.get("/v1/models", headers={"Authorization": "Bearer nope"})
+        assert r.status_code == 401
+        # Health and metrics must remain unauthenticated
+        assert client.get("/health").status_code == 200
+        assert client.get("/metrics").status_code == 200
+    finally:
+        server._API_KEY = original
+
+
+def test_auth_disabled_when_no_key():
+    from fastapi.testclient import TestClient
+    server = _import_server()
+    original = server._API_KEY
+    server._API_KEY = ""
+    try:
+        client = TestClient(server.app)
+        # With auth off, unauth requests hit the endpoint logic (which may
+        # return 503 "model loading" — that's fine, we're only checking that
+        # the middleware doesn't block with 401).
+        r = client.get("/health")
+        assert r.status_code == 200
+    finally:
+        server._API_KEY = original

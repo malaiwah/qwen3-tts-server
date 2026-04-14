@@ -318,6 +318,46 @@ Returns all supported speaker names plus the OpenAI alias mapping.
 
 Standard introspection endpoints.  `/health` includes the active backend tier.
 
+### `GET /metrics` — Prometheus exposition
+
+Plain-text Prometheus exposition for scraping by Prometheus/VictoriaMetrics/OTEL collectors.
+Always unauthenticated (standard ops convention).  Exposed metrics:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `qwen3_tts_requests_total` | counter | `method, path, status` | HTTP requests handled |
+| `qwen3_tts_request_duration_seconds` | histogram | `method, path` | Request latency |
+| `qwen3_tts_requests_in_flight` | gauge | — | Requests currently in progress |
+| `qwen3_tts_model_ready` | gauge | — | 1 when the model is loaded, 0 otherwise |
+| `qwen3_tts_backend_info` | gauge | `device, backend, model_id` | Always 1; labels describe the backend |
+
+Standard `process_*` and `python_gc_*` metrics are included automatically by
+`prometheus_client`.
+
+---
+
+## Authentication (optional)
+
+By default the server is unauthenticated (matching typical self-hosted usage).
+To require a bearer token on `/v1/*` endpoints set either an env var or a CLI flag:
+
+```bash
+# Env var (recommended for containers)
+docker run -e QWEN_API_KEY=sk-mysecret ghcr.io/malaiwah/qwen3-tts-server:latest …
+
+# Or CLI flag
+python server.py --api-key sk-mysecret
+```
+
+Callers must then send `Authorization: Bearer sk-mysecret`.
+`/health` and `/metrics` stay unauthenticated regardless, so ops scrapers and
+container health checks keep working.
+
+```python
+from openai import OpenAI
+client = OpenAI(api_key="sk-mysecret", base_url="http://localhost:8001/v1")
+```
+
 ---
 
 ## Configuration
@@ -328,6 +368,7 @@ Standard introspection endpoints.  `/health` includes the active backend tier.
 | `QWEN3_TTS_MAX_TEXT_LENGTH` | `10000` | Maximum input characters (returns HTTP 413 if exceeded) |
 | `HF_HOME` | `/root/.cache/huggingface` | Where weights are cached. **Mount a volume here.** |
 | `HF_TOKEN` | *(unset)* | HuggingFace token for gated downloads |
+| `QWEN_API_KEY` | *(unset)* | Require `Authorization: Bearer <key>` on `/v1/*` |
 
 CLI flags:
 
@@ -335,8 +376,27 @@ CLI flags:
 |---|---|---|
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8001` | Listen port |
+| `--api-key` | *(env / off)* | Overrides `QWEN_API_KEY` for bearer-token auth |
 | `--cpu` | *(off)* | Force CPU mode. **Very slow.** |
 | `--log-level` | `info` | Uvicorn log level |
+
+---
+
+## Benchmarking
+
+A standalone `benchmark.py` measures steady-state wall-clock latency + RTF
+across short/medium/long workloads:
+
+```bash
+./benchmark.py                                   # built-in workloads, 5 runs
+./benchmark.py --url http://my-gpu-host:8001 --voice aiden --language French
+./benchmark.py --workloads short,long --runs 10
+./benchmark.py --text "Custom sentence to time."
+```
+
+First run per workload is warmup (excluded from the average); the rest feed a
+simple mean.  The RTX 4080 SUPER / 5090 numbers in the tables above were
+produced with this script.
 
 ---
 
