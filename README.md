@@ -169,8 +169,13 @@ flowchart LR
 # 1. Synthesise
 ./test-tts.py "The quick brown fox jumps over the lazy dog." -o sample.wav --format wav
 
-# 2. Transcribe (using qwen3-asr-server)
-./test-asr.py sample.wav   # see github.com/malaiwah/qwen3-asr-server
+# 2. Transcribe — run test-asr.py from the qwen3-asr-server repo:
+#    https://github.com/malaiwah/qwen3-asr-server
+# Or hit the ASR endpoint directly:
+curl -s -X POST http://localhost:8002/v1/audio/transcriptions \
+  -F model=Qwen/Qwen3-ASR-1.7B \
+  -F file=@sample.wav
+# → {"text": "The quick brown fox jumps over the lazy dog."}
 ```
 
 To run both services together with automatic GPU sharing and startup ordering:
@@ -194,7 +199,7 @@ See [`docker-compose.yml`](docker-compose.yml) for the full configuration includ
 | **CPU** | Intel Core i7-14700 KF (20 cores / 28 threads) |
 | **RAM** | 32 GB DDR5 |
 | **OS** | Ubuntu 24.04.4 LTS |
-| **Driver** | NVIDIA 595.58.03 (CUDA 13.x, driver-compat tier) |
+| **Driver** | NVIDIA 595.58.03 (CUDA 13.x) |
 
 ### Also validated on
 
