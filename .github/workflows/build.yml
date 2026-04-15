@@ -28,7 +28,7 @@ jobs:
       - name: Install test dependencies (CPU-only torch)
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install fastapi uvicorn soundfile numpy httpx pytest prometheus-client
+          pip install fastapi uvicorn soundfile numpy httpx pytest prometheus-client python-multipart safetensors
 
       - name: Run smoke tests
         run: pytest -q tests/
