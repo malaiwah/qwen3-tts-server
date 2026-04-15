@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+import subprocess
 import tempfile
 import threading
 import time
@@ -345,11 +346,45 @@ class VoiceRegistry:
 
         # ----------------------------------------------------------------
         # Tier-1 path (FasterQwen3TTS): no create_voice_clone_prompt API.
-        # Save the raw audio on disk; generation passes it at call time.
+        # Save the reference audio on disk as WAV (soundfile-compatible) so
+        # FasterQwen3TTS can load it via sf.read() at generation time.
+        # M4A/AAC and other container formats are transcoded to WAV via ffmpeg.
         # ----------------------------------------------------------------
         if not hasattr(self._model, "create_voice_clone_prompt"):
-            audio_file = self.custom_dir / f"{voice_id}{ref_audio_suffix}"
-            audio_file.write_bytes(ref_audio_bytes)
+            # soundfile supports WAV, FLAC, OGG, AIFF but not M4A/AAC/MP4.
+            _SOUNDFILE_NATIVE = {".wav", ".flac", ".ogg", ".aiff", ".aif"}
+            if ref_audio_suffix.lower() in _SOUNDFILE_NATIVE:
+                audio_file = self.custom_dir / f"{voice_id}{ref_audio_suffix}"
+                audio_file.write_bytes(ref_audio_bytes)
+            else:
+                # Transcode to 16-bit 24 kHz mono WAV via ffmpeg (matches TTS sample rate).
+                audio_file = self.custom_dir / f"{voice_id}.wav"
+                with tempfile.NamedTemporaryFile(
+                    suffix=ref_audio_suffix, dir=str(self.custom_dir), delete=False,
+                ) as tmp:
+                    tmp.write(ref_audio_bytes)
+                    tmp_path = tmp.name
+                try:
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-y", "-loglevel", "error",
+                            "-i", tmp_path,
+                            "-ar", "24000", "-ac", "1", "-sample_fmt", "s16",
+                            str(audio_file),
+                        ],
+                        check=True, timeout=60,
+                    )
+                except subprocess.CalledProcessError as exc:
+                    raise RuntimeError(
+                        f"ffmpeg transcoding of {ref_audio_suffix} to WAV failed: {exc}"
+                    ) from exc
+                finally:
+                    Path(tmp_path).unlink(missing_ok=True)
+                logger.info(
+                    "Transcoded %s → WAV (%d KB → %d KB) for Tier-1 clone %s",
+                    ref_audio_suffix, len(ref_audio_bytes) // 1024,
+                    audio_file.stat().st_size // 1024, voice_id,
+                )
             meta = {
                 "id": voice_id,
                 "name": name.strip(),
