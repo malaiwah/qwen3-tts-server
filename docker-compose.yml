@@ -36,6 +36,13 @@ services:
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
       - HF_HOME=/root/.cache/huggingface
+      # Auto-transcription for POST /v1/voices — forwards the reference
+      # clip to the ASR sibling when the client omits ref_text, so clones
+      # get full ICL-mode quality without requiring users to transcribe
+      # their own samples.  Failure is non-fatal (falls back to
+      # x-vector-only).
+      - QWEN3_TTS_ASR_URL=http://asr:8000
+      - QWEN3_TTS_ASR_API_KEY=${QWEN_API_KEY:-}
     healthcheck:
       test: >
         python3 -c "import urllib.request,json,sys;

@@ -336,8 +336,9 @@ Multipart form with an audio reference clip, returns the new voice record (201 C
 |---|---|---|
 | `name` | yes | Human-friendly label (any string). |
 | `audio` | yes | Reference clip. 3–30 s recommended. WAV/MP3/FLAC/OGG. |
-| `ref_text` | no | Transcript of the clip. When provided, enables full **in-context learning mode** (closer clone, prosody-aware). Without it, falls back to **x-vector-only** mode. |
-| `language` | no | Metadata only (e.g. `"English"`, `"French"`). |
+| `ref_text` | no | Transcript of the clip. When provided (or auto-transcribed — see below), enables full **in-context learning mode** (closer clone, prosody-aware). Without it, falls back to **x-vector-only** mode. |
+| `language` | no | Language hint (e.g. `"English"`, `"French"`). Forwarded to the ASR service when auto-transcribing. |
+| `auto_transcribe` | no | Per-request override of the default (on when `QWEN3_TTS_ASR_URL` is set). Send `false` to force x-vector-only mode. |
 
 ```bash
 # x-vector-only clone (no transcript needed)
@@ -362,6 +363,21 @@ curl -X POST http://localhost:8001/v1/audio/speech \
 Clones persist to `$QWEN3_TTS_VOICES_DIR/custom/` (default `/data/voices/custom/`)
 as `<id>.safetensors` + `<id>.json` sidecars, ~13 KB total per clone.
 Mount that path as a volume so clones survive container restarts.
+
+**Auto-transcription** is wired in via `QWEN3_TTS_ASR_URL`. When set, any
+`POST /v1/voices` without `ref_text` forwards the audio clip to that
+endpoint (OpenAI-compatible `POST /v1/audio/transcriptions`, matching
+qwen3-asr-server) and uses the returned text to enable full ICL mode. The
+response includes `"auto_transcribed": true` when this path was taken.
+The ASR call is best-effort: any failure (network, auth, empty result)
+falls back silently to x-vector-only mode. Typical compose wiring:
+
+```yaml
+# docker-compose.yml — tts service environment
+environment:
+  - QWEN3_TTS_ASR_URL=http://asr:8000
+  - QWEN3_TTS_ASR_API_KEY=${QWEN_API_KEY:-}
+```
 
 ### `DELETE /v1/voices/{voice_id}` — remove a clone
 
@@ -423,6 +439,10 @@ client = OpenAI(api_key="sk-mysecret", base_url="http://localhost:8001/v1")
 | `QWEN3_TTS_VOICES_DIR` | `/data/voices` | Where user-registered clones persist. **Mount a volume here.** |
 | `QWEN3_TTS_PRESET_BUNDLE` | `assets/preset/bundle.safetensors` | Override preset bundle location. |
 | `QWEN3_TTS_DEFAULT_VOICE` | `ryan` | Default voice when the client omits `voice`. |
+| `QWEN3_TTS_ASR_URL` | *(unset)* | Enable auto-transcription for `POST /v1/voices` by forwarding `audio` to an OpenAI-compatible `/v1/audio/transcriptions` endpoint (e.g. `http://qwen3-asr:8000`). Unset → silent x-vector-only fallback. |
+| `QWEN3_TTS_ASR_API_KEY` | *(unset)* | Bearer token for the ASR endpoint above. |
+| `QWEN3_TTS_ASR_MODEL` | `Qwen/Qwen3-ASR-1.7B` | `model` field sent with each transcription request. |
+| `QWEN3_TTS_ASR_TIMEOUT` | `30` | Seconds before the ASR call gives up and we fall back to x-vector-only. |
 | `HF_HOME` | `/root/.cache/huggingface` | Where weights are cached. **Mount a volume here.** |
 | `HF_TOKEN` | *(unset)* | HuggingFace token for gated downloads. |
 | `QWEN_API_KEY` | *(unset)* | Require `Authorization: Bearer <key>` on `/v1/*`. |

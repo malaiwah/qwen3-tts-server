@@ -43,7 +43,7 @@ RUN pip install --no-cache-dir torch torchvision torchaudio \
 RUN pip install --no-cache-dir \
         faster-qwen3-tts qwen-tts \
         soundfile fastapi uvicorn prometheus-client \
-        safetensors python-multipart
+        safetensors python-multipart httpx
 
 # Flash Attention 2 (optional — tier-2 speedup for the qwen_tts fallback path).
 # Only installs a pre-built binary wheel; never compiles from source so CI stays fast.

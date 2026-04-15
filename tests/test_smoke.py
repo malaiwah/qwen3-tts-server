@@ -380,6 +380,309 @@ def test_register_voice_round_trip(tmp_path):
         reg.bind_model(None)
 
 
+def test_register_voice_auto_transcribes_when_asr_configured(tmp_path):
+    """When ref_text is omitted and ASR_URL is set, we forward audio to ASR.
+
+    Mocks httpx.AsyncClient to verify the ASR endpoint is called and the
+    returned text flows into the sidecar metadata.
+    """
+    from fastapi.testclient import TestClient
+    import torch
+
+    server = _import_server()
+    reg = server._voice_registry
+
+    # Redirect registry to a temp dir.
+    original_dir = reg.custom_dir
+    reg.custom_dir = tmp_path
+    original_asr_url = server.ASR_URL
+    original_api_key = server._API_KEY
+    original_ready = server._model_ready
+    server.ASR_URL = "http://fake-asr:8000"
+    server._API_KEY = ""
+    server._model_ready = True
+    if not isinstance(getattr(server, "_INFER_SEM", None), asyncio.Semaphore):
+        server._INFER_SEM = asyncio.Semaphore(1)
+
+    captured: dict = {}
+
+    class _FakeResponse:
+        status_code = 200
+        text = ""
+        def json(self):
+            return {"text": "Hello world transcribed by ASR."}
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return None
+        async def post(self, url, data=None, files=None, headers=None):
+            captured["url"] = url
+            captured["data"] = data
+            captured["headers"] = headers
+            captured["file_keys"] = list((files or {}).keys())
+            return _FakeResponse()
+
+    class _FakeHttpxModule:
+        AsyncClient = _FakeAsyncClient
+
+    # Stub qwen_tts's create_voice_clone_prompt on the registry's model.
+    class _FakeItem:
+        ref_spk_embedding = torch.zeros(2048, dtype=torch.float32)
+        ref_code = None
+        x_vector_only_mode = False
+        icl_mode = True
+        ref_text = "set-by-fake"
+
+    captured_prompt: dict = {}
+
+    class _FakeModel:
+        def create_voice_clone_prompt(self, ref_audio, ref_text, x_vector_only_mode):
+            captured_prompt["ref_text"] = ref_text
+            captured_prompt["x_vector_only_mode"] = x_vector_only_mode
+            return [_FakeItem()]
+
+    reg.bind_model(_FakeModel())
+
+    try:
+        with patch.dict(sys.modules, {"httpx": _FakeHttpxModule}):
+            client = TestClient(server.app)
+            r = client.post(
+                "/v1/voices",
+                files={"audio": ("bob.wav", io.BytesIO(b"RIFFwav"), "audio/wav")},
+                data={"name": "Bob", "language": "English"},
+            )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["auto_transcribed"] is True
+
+        # ASR was called with the right URL + multipart file.
+        assert captured["url"] == "http://fake-asr:8000/v1/audio/transcriptions"
+        assert captured["file_keys"] == ["file"]
+        assert captured["data"]["language"] == "English"
+
+        # The transcribed text flowed into create_voice_clone_prompt as
+        # ref_text, and we took the ICL path (x_vector_only_mode=False).
+        assert captured_prompt["ref_text"] == "Hello world transcribed by ASR."
+        assert captured_prompt["x_vector_only_mode"] is False
+    finally:
+        reg.custom_dir = original_dir
+        server.ASR_URL = original_asr_url
+        server._API_KEY = original_api_key
+        server._model_ready = original_ready
+        reg.bind_model(None)
+
+
+def test_register_voice_falls_back_when_asr_fails(tmp_path):
+    """When the ASR call raises, we silently use x_vector_only_mode."""
+    from fastapi.testclient import TestClient
+    import torch
+
+    server = _import_server()
+    reg = server._voice_registry
+
+    original_dir = reg.custom_dir
+    reg.custom_dir = tmp_path
+    original_asr_url = server.ASR_URL
+    original_api_key = server._API_KEY
+    original_ready = server._model_ready
+    server.ASR_URL = "http://fake-asr:8000"
+    server._API_KEY = ""
+    server._model_ready = True
+    if not isinstance(getattr(server, "_INFER_SEM", None), asyncio.Semaphore):
+        server._INFER_SEM = asyncio.Semaphore(1)
+
+    class _ExplodingClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return None
+        async def post(self, *a, **kw):
+            raise RuntimeError("connection refused (test)")
+
+    class _FakeHttpxModule:
+        AsyncClient = _ExplodingClient
+
+    class _FakeItem:
+        ref_spk_embedding = torch.zeros(2048, dtype=torch.float32)
+        ref_code = None
+        x_vector_only_mode = True
+        icl_mode = False
+        ref_text = None
+
+    captured_prompt: dict = {}
+
+    class _FakeModel:
+        def create_voice_clone_prompt(self, ref_audio, ref_text, x_vector_only_mode):
+            captured_prompt["x_vector_only_mode"] = x_vector_only_mode
+            return [_FakeItem()]
+
+    reg.bind_model(_FakeModel())
+
+    try:
+        with patch.dict(sys.modules, {"httpx": _FakeHttpxModule}):
+            client = TestClient(server.app)
+            r = client.post(
+                "/v1/voices",
+                files={"audio": ("x.wav", io.BytesIO(b"wav"), "audio/wav")},
+                data={"name": "NoTranscript"},
+            )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["auto_transcribed"] is False
+        # Fell back to x_vector_only_mode because ASR errored.
+        assert captured_prompt["x_vector_only_mode"] is True
+    finally:
+        reg.custom_dir = original_dir
+        server.ASR_URL = original_asr_url
+        server._API_KEY = original_api_key
+        server._model_ready = original_ready
+        reg.bind_model(None)
+
+
+def test_register_voice_skips_asr_when_ref_text_supplied(tmp_path):
+    """If the client provides ref_text we must NOT call ASR even when configured."""
+    from fastapi.testclient import TestClient
+    import torch
+
+    server = _import_server()
+    reg = server._voice_registry
+
+    original_dir = reg.custom_dir
+    reg.custom_dir = tmp_path
+    original_asr_url = server.ASR_URL
+    original_api_key = server._API_KEY
+    original_ready = server._model_ready
+    server.ASR_URL = "http://fake-asr:8000"
+    server._API_KEY = ""
+    server._model_ready = True
+    if not isinstance(getattr(server, "_INFER_SEM", None), asyncio.Semaphore):
+        server._INFER_SEM = asyncio.Semaphore(1)
+
+    calls = {"count": 0}
+
+    class _CountingClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return None
+        async def post(self, *a, **kw):
+            calls["count"] += 1
+            raise AssertionError("ASR must not be called when ref_text is supplied")
+
+    class _FakeHttpxModule:
+        AsyncClient = _CountingClient
+
+    class _FakeItem:
+        ref_spk_embedding = torch.zeros(2048, dtype=torch.float32)
+        ref_code = None
+        x_vector_only_mode = False
+        icl_mode = True
+        ref_text = "provided"
+
+    class _FakeModel:
+        def create_voice_clone_prompt(self, ref_audio, ref_text, x_vector_only_mode):
+            return [_FakeItem()]
+
+    reg.bind_model(_FakeModel())
+
+    try:
+        with patch.dict(sys.modules, {"httpx": _FakeHttpxModule}):
+            client = TestClient(server.app)
+            r = client.post(
+                "/v1/voices",
+                files={"audio": ("x.wav", io.BytesIO(b"wav"), "audio/wav")},
+                data={"name": "Supplied", "ref_text": "The rain in Spain."},
+            )
+        assert r.status_code == 201, r.text
+        assert calls["count"] == 0
+        assert r.json()["auto_transcribed"] is False
+    finally:
+        reg.custom_dir = original_dir
+        server.ASR_URL = original_asr_url
+        server._API_KEY = original_api_key
+        server._model_ready = original_ready
+        reg.bind_model(None)
+
+
+def test_register_voice_auto_transcribe_false_skips_asr(tmp_path):
+    """Passing auto_transcribe=false forces x-vector-only even when ASR is set."""
+    from fastapi.testclient import TestClient
+    import torch
+
+    server = _import_server()
+    reg = server._voice_registry
+
+    original_dir = reg.custom_dir
+    reg.custom_dir = tmp_path
+    original_asr_url = server.ASR_URL
+    original_api_key = server._API_KEY
+    original_ready = server._model_ready
+    server.ASR_URL = "http://fake-asr:8000"
+    server._API_KEY = ""
+    server._model_ready = True
+    if not isinstance(getattr(server, "_INFER_SEM", None), asyncio.Semaphore):
+        server._INFER_SEM = asyncio.Semaphore(1)
+
+    calls = {"count": 0}
+
+    class _CountingClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return None
+        async def post(self, *a, **kw):
+            calls["count"] += 1
+            raise AssertionError("ASR must not be called when auto_transcribe=false")
+
+    class _FakeHttpxModule:
+        AsyncClient = _CountingClient
+
+    class _FakeItem:
+        ref_spk_embedding = torch.zeros(2048, dtype=torch.float32)
+        ref_code = None
+        x_vector_only_mode = True
+        icl_mode = False
+        ref_text = None
+
+    captured_prompt: dict = {}
+
+    class _FakeModel:
+        def create_voice_clone_prompt(self, ref_audio, ref_text, x_vector_only_mode):
+            captured_prompt["x_vector_only_mode"] = x_vector_only_mode
+            return [_FakeItem()]
+
+    reg.bind_model(_FakeModel())
+
+    try:
+        with patch.dict(sys.modules, {"httpx": _FakeHttpxModule}):
+            client = TestClient(server.app)
+            r = client.post(
+                "/v1/voices",
+                files={"audio": ("x.wav", io.BytesIO(b"wav"), "audio/wav")},
+                data={"name": "OptOut", "auto_transcribe": "false"},
+            )
+        assert r.status_code == 201, r.text
+        assert calls["count"] == 0
+        assert r.json()["auto_transcribed"] is False
+        assert captured_prompt["x_vector_only_mode"] is True
+    finally:
+        reg.custom_dir = original_dir
+        server.ASR_URL = original_asr_url
+        server._API_KEY = original_api_key
+        server._model_ready = original_ready
+        reg.bind_model(None)
+
+
 def test_register_voice_requires_model_ready():
     """When _model_ready is False, POST /v1/voices must return 503."""
     from fastapi.testclient import TestClient

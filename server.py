@@ -74,6 +74,16 @@ MAX_TEXT_LENGTH = int(os.getenv("QWEN3_TTS_MAX_TEXT_LENGTH", "10000"))
 # covers a 60 s 16-bit 48 kHz mono WAV clip plus headers.
 MAX_REF_AUDIO_BYTES = int(os.getenv("QWEN3_TTS_MAX_REF_AUDIO_BYTES", str(10 * 1024 * 1024)))
 
+# Optional auto-transcription for POST /v1/voices — when the client omits
+# ``ref_text`` we can forward the audio to an ASR service (qwen3-asr-server
+# or any OpenAI-compatible /v1/audio/transcriptions) and use the returned
+# text to enable full in-context learning mode.  When unset, we silently
+# fall back to x-vector-only mode for prompt-less registrations.
+ASR_URL = os.getenv("QWEN3_TTS_ASR_URL", "") or ""
+ASR_API_KEY = os.getenv("QWEN3_TTS_ASR_API_KEY", "") or ""
+ASR_MODEL = os.getenv("QWEN3_TTS_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
+ASR_TIMEOUT_S = float(os.getenv("QWEN3_TTS_ASR_TIMEOUT", "30"))
+
 # Voice registry layout.  Presets ship in the repo as a ~37 KB bundle;
 # custom clones persist in a writable volume (typically a Docker volume
 # mounted at /data).
@@ -811,21 +821,87 @@ async def list_voices():
     }
 
 
+async def _transcribe_ref_audio(
+    audio_bytes: bytes,
+    filename: str,
+    language: Optional[str],
+) -> Optional[str]:
+    """Best-effort transcription of the reference clip via an ASR service.
+
+    Returns the transcribed text on success, ``None`` on any failure
+    (network, auth, malformed response).  Failures are logged but non-fatal
+    — the caller falls back to x-vector-only clone mode.
+
+    Configured by ``QWEN3_TTS_ASR_URL`` (required; disables this helper when
+    empty), ``QWEN3_TTS_ASR_API_KEY`` (bearer token), ``QWEN3_TTS_ASR_MODEL``,
+    and ``QWEN3_TTS_ASR_TIMEOUT``.  Protocol is OpenAI-compatible
+    ``POST /v1/audio/transcriptions`` with multipart form, matching
+    qwen3-asr-server and the reference OpenAI endpoint.
+    """
+    if not ASR_URL:
+        return None
+    # Local import so httpx is only loaded when ASR integration is actually
+    # wired up.  httpx is already a transitive dep via starlette's TestClient
+    # and is installed explicitly in production.
+    import httpx
+
+    url = ASR_URL.rstrip("/") + "/v1/audio/transcriptions"
+    files = {"file": (filename, audio_bytes, "application/octet-stream")}
+    data: dict[str, str] = {"model": ASR_MODEL, "response_format": "json"}
+    if language:
+        data["language"] = language
+    headers: dict[str, str] = {}
+    if ASR_API_KEY:
+        headers["Authorization"] = f"Bearer {ASR_API_KEY}"
+
+    try:
+        async with httpx.AsyncClient(timeout=ASR_TIMEOUT_S) as client:
+            resp = await client.post(url, data=data, files=files, headers=headers)
+        if resp.status_code >= 400:
+            logger.warning(
+                "Auto-transcription returned HTTP %d; falling back to x-vector-only. body=%s",
+                resp.status_code, resp.text[:300],
+            )
+            return None
+        body = resp.json()
+        text = (body.get("text") or "").strip()
+        if not text:
+            logger.warning("Auto-transcription returned empty text; falling back.")
+            return None
+        logger.info("Auto-transcription: %d chars (lang=%s)", len(text), language)
+        return text
+    except Exception as exc:  # noqa: BLE001
+        # Network errors, JSON decode errors, timeouts — all non-fatal.
+        logger.warning("Auto-transcription failed (%s); falling back to x-vector-only.", exc)
+        return None
+
+
 @app.post("/v1/voices")
 async def register_voice(
     name: str = Form(..., description="Human-friendly label for the voice."),
     audio: UploadFile = File(..., description="Reference audio clip (WAV/MP3/FLAC/OGG). 3–30 s recommended."),
     ref_text: Optional[str] = Form(
         None,
-        description="Optional transcript of the reference audio. When provided, enables full in-context learning mode (closer clone, prosody-aware).",
+        description="Optional transcript of the reference audio. When provided (or when auto-transcription via QWEN3_TTS_ASR_URL is configured), enables full in-context learning mode (closer clone, prosody-aware).",
     ),
-    language: Optional[str] = Form(None, description="Language hint, e.g. 'English' (metadata only)."),
+    language: Optional[str] = Form(None, description="Language hint, e.g. 'English'. Forwarded to ASR when auto-transcribing."),
+    auto_transcribe: Optional[bool] = Form(
+        None,
+        description="Per-request override. Defaults to True when QWEN3_TTS_ASR_URL is set. Pass False to force x-vector-only mode even when ASR is configured.",
+    ),
 ):
     """Register a new custom voice from a reference audio clip.
 
     Returns the voice record (including the assigned ``id``, e.g.
     ``vc_ab12cd34``) which can then be used as the ``voice`` parameter on
     ``/v1/audio/speech`` and its streaming variants.
+
+    Transcription handling:
+      - ``ref_text`` provided  → full ICL mode with that text.
+      - ``ref_text`` omitted, ASR configured, auto_transcribe != False
+        → forward ``audio`` to the ASR service, use returned text.
+      - ``ref_text`` omitted, ASR unavailable/disabled/failed
+        → x-vector-only mode (no prosody conditioning).
     """
     if not _model_ready:
         raise HTTPException(503, "Model is still loading. Check /health and retry.")
@@ -845,6 +921,19 @@ async def register_voice(
     suffix = Path(audio.filename or "").suffix.lower() or ".wav"
     if suffix not in (".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a"):
         logger.info("Unusual audio suffix %r — soundfile/ffmpeg will attempt decode.", suffix)
+
+    transcribed = False
+    if (
+        (not ref_text or not ref_text.strip())
+        and ASR_URL
+        and auto_transcribe is not False
+    ):
+        asr_text = await _transcribe_ref_audio(
+            data, audio.filename or f"sample{suffix}", language,
+        )
+        if asr_text:
+            ref_text = asr_text
+            transcribed = True
 
     # Clone-prompt creation runs a model forward (ECAPA + optional tokeniser)
     # on the GPU, so acquire the inference semaphore.
@@ -866,7 +955,11 @@ async def register_voice(
             logger.exception("register_voice failed")
             raise HTTPException(422, f"could not create clone prompt: {exc}") from exc
 
-    return JSONResponse(status_code=201, content=record.summary())
+    payload = record.summary()
+    # Signal to the caller whether we auto-filled ref_text so they can
+    # surface that in their UI (e.g. "Transcribed via ASR: ...").
+    payload["auto_transcribed"] = transcribed
+    return JSONResponse(status_code=201, content=payload)
 
 
 @app.delete("/v1/voices/{voice_id}")
