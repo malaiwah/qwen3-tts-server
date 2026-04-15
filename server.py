@@ -464,18 +464,34 @@ def _generate_audio_sync(text: str, voice_id: str, instruct: str | None, languag
     """Synchronous TTS generation — call via asyncio.to_thread.
 
     ``voice_id`` must already have been resolved through :func:`_resolve_voice`.
+
+    Supports two synthesis paths:
+
+    - **prompt_item path** (Tier 2/3 and preset voices): passes the pre-extracted
+      ``VoiceClonePromptItem`` in ``voice_clone_prompt``.  Always used for presets.
+    - **ref_audio path** (Tier-1 / FasterQwen3TTS custom clones): passes
+      ``ref_audio`` + ``ref_text`` directly; the model extracts the speaker
+      embedding at call time.  Used when ``record.ref_audio_path`` is set.
     """
     record = _voice_registry.get(voice_id)
     if record is None:
         # Shouldn't happen if _resolve_voice was used, but guard defensively.
         raise HTTPException(400, f"Unknown voice '{voice_id}'.")
+
     kwargs: dict = {
         "text": text,
         "language": language or "English",
-        "voice_clone_prompt": [record.prompt_item],
     }
     if instruct:
         kwargs["instruct"] = instruct
+
+    if record.ref_audio_path is not None:
+        # Tier-1 path: FasterQwen3TTS accepts ref_audio + ref_text directly.
+        kwargs["ref_audio"] = str(record.ref_audio_path)
+        kwargs["ref_text"] = record.ref_text_str or ""
+    else:
+        kwargs["voice_clone_prompt"] = [record.prompt_item]
+
     wavs, sr = _model.generate_voice_clone(**kwargs)
     return wavs[0], sr
 
@@ -710,12 +726,17 @@ async def speech_pcm_stream(
                 try:
                     kwargs: dict = {
                         "text": text_in,
-                        "voice_clone_prompt": [record.prompt_item],
                         "language": p["language"] or "English",
                         "chunk_size": chunk_size,
                     }
                     if p.get("instruct"):
                         kwargs["instruct"] = p["instruct"]
+                    # Tier-1 custom clones: use ref_audio path instead of prompt_item.
+                    if record.ref_audio_path is not None:
+                        kwargs["ref_audio"] = str(record.ref_audio_path)
+                        kwargs["ref_text"] = record.ref_text_str or ""
+                    else:
+                        kwargs["voice_clone_prompt"] = [record.prompt_item]
                     for item in _model.generate_voice_clone_streaming(**kwargs):
                         loop.call_soon_threadsafe(queue.put_nowait, item)
                 except Exception as exc:  # noqa: BLE001

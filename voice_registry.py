@@ -53,13 +53,32 @@ KIND_CUSTOM = "custom"
 
 @dataclass
 class VoiceRecord:
-    """In-memory record for one voice (preset or custom)."""
+    """In-memory record for one voice (preset or custom).
+
+    Two synthesis paths are supported depending on the active backend:
+
+    **Tier 2/3 (Qwen3TTSModel)** — ``prompt_item`` holds a pre-extracted
+    ``VoiceClonePromptItem`` (speaker embedding + optional prosody tokens).
+    Built at registration time via ``Qwen3TTSModel.create_voice_clone_prompt()``.
+
+    **Tier 1 (FasterQwen3TTS)** — ``prompt_item`` is ``None``; instead
+    ``ref_audio_path`` points to the persisted reference audio file and
+    ``ref_text_str`` holds the transcript.  Both are passed directly to
+    ``FasterQwen3TTS.generate_voice_clone(ref_audio=…, ref_text=…)`` at
+    synthesis time, which resolves the speaker embedding internally.
+
+    Preset voices always use the Tier 2/3 path (pre-extracted embeddings
+    loaded from the safetensors bundle) regardless of the active backend.
+    """
     id: str
     kind: str                 # "preset" | "custom"
     name: str                 # Human-friendly label (may equal id for presets)
-    prompt_item: Any          # qwen_tts.VoiceClonePromptItem — kept opaque
+    prompt_item: Any          # qwen_tts.VoiceClonePromptItem, or None (Tier 1 custom)
     created_at: Optional[float] = None
     meta: Optional[dict] = None   # Freeform extra info for /v1/voices responses
+    # Tier-1 path (FasterQwen3TTS): reference audio kept on disk, resolved per-call.
+    ref_audio_path: Optional[Path] = None
+    ref_text_str: Optional[str] = None
 
     def summary(self) -> dict:
         """Serializable summary for /v1/voices listing."""
@@ -72,6 +91,9 @@ class VoiceRecord:
             out["created_at"] = int(self.created_at)
         if self.meta:
             out.update(self.meta)
+        if self.ref_audio_path is not None:
+            # Signal to callers that this is a Tier-1 (ref-audio) clone.
+            out["clone_mode"] = "ref_audio"
         return out
 
 
@@ -196,11 +218,47 @@ class VoiceRegistry:
 
     def _load_one_custom(self, voice_id: str) -> VoiceRecord:
         meta_path = self.custom_dir / f"{voice_id}.json"
-        tensors_path = self.custom_dir / f"{voice_id}.safetensors"
-        if not meta_path.is_file() or not tensors_path.is_file():
-            raise FileNotFoundError(f"missing sidecar files for {voice_id}")
+        if not meta_path.is_file():
+            raise FileNotFoundError(f"missing sidecar JSON for {voice_id}")
 
         meta = json.loads(meta_path.read_text())
+
+        # ----------------------------------------------------------------
+        # Tier-1 (FasterQwen3TTS) clone — sidecar has a ref_audio file
+        # instead of pre-extracted safetensor embeddings.
+        # ----------------------------------------------------------------
+        if meta.get("clone_mode") == "ref_audio":
+            # Find the reference audio file (any supported suffix).
+            ref_audio_path: Optional[Path] = None
+            for suf in (".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a"):
+                candidate = self.custom_dir / f"{voice_id}{suf}"
+                if candidate.is_file():
+                    ref_audio_path = candidate
+                    break
+            if ref_audio_path is None:
+                raise FileNotFoundError(
+                    f"ref_audio file not found for Tier-1 clone {voice_id}"
+                )
+            record = VoiceRecord(
+                id=voice_id,
+                kind=KIND_CUSTOM,
+                name=meta.get("name") or voice_id,
+                prompt_item=None,
+                created_at=meta.get("created_at"),
+                meta={k: meta[k] for k in ("language_hint", "ref_text", "clone_mode") if k in meta},
+                ref_audio_path=ref_audio_path,
+                ref_text_str=meta.get("ref_text") or "",
+            )
+            self._voices[voice_id] = record
+            return record
+
+        # ----------------------------------------------------------------
+        # Tier-2/3 (Qwen3TTSModel) clone — safetensors sidecar.
+        # ----------------------------------------------------------------
+        tensors_path = self.custom_dir / f"{voice_id}.safetensors"
+        if not tensors_path.is_file():
+            raise FileNotFoundError(f"missing safetensors sidecar for {voice_id}")
+
         tensors = load_file(str(tensors_path))
         ref_spk_embedding = tensors.get("ref_spk_embedding")
         if ref_spk_embedding is None:
@@ -262,22 +320,70 @@ class VoiceRegistry:
     ) -> VoiceRecord:
         """Create a new custom voice from a reference audio clip.
 
-        If ``ref_text`` is provided, uses full ICL mode (prosody tokens + speaker
-        embedding); otherwise falls back to x-vector-only mode.  The former gives
-        a closer clone on supported content; the latter works even with no
-        transcription pipeline and is robust to ref-text/audio mismatch.
+        Two registration paths depending on the active backend:
+
+        **Tier 2/3 (Qwen3TTSModel)** — calls ``create_voice_clone_prompt()`` to
+        pre-extract the speaker embedding and optional prosody tokens, then
+        persists them as a safetensors sidecar.  If ``ref_text`` is provided
+        (or auto-transcribed), uses full ICL mode; otherwise x-vector-only.
+
+        **Tier 1 (FasterQwen3TTS)** — the model has no
+        ``create_voice_clone_prompt`` method; instead it accepts ``ref_audio``
+        + ``ref_text`` directly at generation time via ``generate_voice_clone``.
+        The reference audio is saved verbatim in the custom voices directory and
+        re-used on every synthesis call.  Quality is equivalent to Tier 2/3 ICL
+        mode; the trade-off is a small per-call overhead for embedding
+        extraction (vs. a one-time cost at registration).
         """
         if self._model is None:
             raise RuntimeError("VoiceRegistry.register called before model bound")
         if not name or not name.strip():
             raise ValueError("name is required")
 
+        self.custom_dir.mkdir(parents=True, exist_ok=True)
+        voice_id = self._next_voice_id()
+
+        # ----------------------------------------------------------------
+        # Tier-1 path (FasterQwen3TTS): no create_voice_clone_prompt API.
+        # Save the raw audio on disk; generation passes it at call time.
+        # ----------------------------------------------------------------
+        if not hasattr(self._model, "create_voice_clone_prompt"):
+            audio_file = self.custom_dir / f"{voice_id}{ref_audio_suffix}"
+            audio_file.write_bytes(ref_audio_bytes)
+            meta = {
+                "id": voice_id,
+                "name": name.strip(),
+                "created_at": int(time.time()),
+                "ref_text": ref_text.strip() if ref_text and ref_text.strip() else None,
+                "language_hint": language,
+                "clone_mode": "ref_audio",
+                "source": "faster-qwen3-tts (ref_audio path)",
+            }
+            (self.custom_dir / f"{voice_id}.json").write_text(json.dumps(meta, indent=2))
+            with self._lock:
+                record = VoiceRecord(
+                    id=voice_id,
+                    kind=KIND_CUSTOM,
+                    name=meta["name"],
+                    prompt_item=None,
+                    created_at=meta["created_at"],
+                    meta={"language_hint": language, "ref_text": meta["ref_text"],
+                          "clone_mode": "ref_audio"},
+                    ref_audio_path=audio_file,
+                    ref_text_str=meta["ref_text"] or "",
+                )
+                self._voices[voice_id] = record
+            logger.info("Registered custom voice %s (%s) — Tier-1 ref_audio path (%d bytes)",
+                        voice_id, name, len(ref_audio_bytes))
+            return record
+
+        # ----------------------------------------------------------------
+        # Tier-2/3 path (Qwen3TTSModel): pre-extract speaker embedding.
+        # ----------------------------------------------------------------
         x_vector_only = ref_text is None or not ref_text.strip()
 
-        # The model API takes a file path.  Write to a temp file in the same
-        # dir as our final home so we can still decode unusual formats via
-        # soundfile/ffmpeg and so any permissions-type failures surface early.
-        self.custom_dir.mkdir(parents=True, exist_ok=True)
+        # The model API takes a file path.  Write to a temp file so we can
+        # decode unusual formats via soundfile/ffmpeg.
         with tempfile.NamedTemporaryFile(
             mode="wb", suffix=ref_audio_suffix, dir=str(self.custom_dir), delete=False,
         ) as tmp:
@@ -299,9 +405,6 @@ class VoiceRegistry:
         if not items:
             raise RuntimeError("create_voice_clone_prompt returned no items")
         item = items[0]
-
-        # Assign a short, unambiguous ID.
-        voice_id = self._next_voice_id()
 
         # Persist as safetensors + json sidecars.
         tensors: dict[str, torch.Tensor] = {}
@@ -345,7 +448,7 @@ class VoiceRegistry:
                 },
             )
             self._voices[voice_id] = record
-        logger.info("Registered custom voice %s (%s) — x_vector_only=%s",
+        logger.info("Registered custom voice %s (%s) — Tier-2/3 x_vector_only=%s",
                     voice_id, name, x_vector_only)
         return record
 
