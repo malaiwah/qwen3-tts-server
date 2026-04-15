@@ -1,0 +1,54 @@
+{
+  "source_repo": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+  "source_tensor": "talker.model.codec_embedding.weight",
+  "dim": 2048,
+  "dtype": "bfloat16",
+  "speakers": {
+    "aiden": {
+      "id": 2861,
+      "gender": "m",
+      "lang": "en,zh"
+    },
+    "dylan": {
+      "id": 2878,
+      "gender": "m",
+      "lang": "en,zh"
+    },
+    "eric": {
+      "id": 2875,
+      "gender": "m",
+      "lang": "en,zh"
+    },
+    "ono_anna": {
+      "id": 2873,
+      "gender": "f",
+      "lang": "ja,en,zh"
+    },
+    "ryan": {
+      "id": 3061,
+      "gender": "m",
+      "lang": "en,zh"
+    },
+    "serena": {
+      "id": 3066,
+      "gender": "f",
+      "lang": "en,zh"
+    },
+    "sohee": {
+      "id": 2864,
+      "gender": "f",
+      "lang": "ko,en,zh"
+    },
+    "uncle_fu": {
+      "id": 3010,
+      "gender": "m",
+      "lang": "zh"
+    },
+    "vivian": {
+      "id": 3065,
+      "gender": "f",
+      "lang": "en,zh"
+    }
+  },
+  "notes": "Lifted rows from CustomVoice codec_embedding. Consumed as VoiceClonePromptItem(ref_spk_embedding=row, x_vector_only_mode=True)."
+}
