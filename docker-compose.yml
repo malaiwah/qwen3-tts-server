@@ -32,6 +32,7 @@ services:
       - "8001:8001"
     volumes:
       - qwen3-hf-cache:/root/.cache/huggingface
+      - qwen3-tts-voices:/data/voices    # user-registered voice clones
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
       - HF_HOME=/root/.cache/huggingface
@@ -95,3 +96,7 @@ volumes:
   qwen3-hf-cache:
     # Shared HuggingFace model cache — weights are downloaded once and reused
     # across container restarts and image upgrades.
+  qwen3-tts-voices:
+    # Persistent store for user-registered voice clones (POST /v1/voices).
+    # Preset voices are baked into the image; only cloned `vc_<id>` entries
+    # live here, so the volume stays small (a few KB per clone).

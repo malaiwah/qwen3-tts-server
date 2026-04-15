@@ -1,6 +1,6 @@
 # qwen3-tts-server
 
-OpenAI-compatible HTTP server for [**Qwen3-TTS-12Hz-1.7B-CustomVoice**](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) with **token-level PCM streaming**, **sentence chunking**, **emotion control**, and **bilingual** generation.
+OpenAI-compatible HTTP server for [**Qwen3-TTS-12Hz-1.7B-Base**](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) with **9 preset voices**, **user-registrable voice clones**, **token-level PCM streaming**, **sentence chunking**, **emotion control**, and **multilingual** generation.
 
 Built for low-latency conversational voice agents — the first audio frame arrives in **~130 ms** on an RTX 4080 SUPER and the model generates speech at **~3–3.4× real-time**.
 
@@ -16,7 +16,8 @@ Built for low-latency conversational voice agents — the first audio frame arri
 - 📦 `/v1/audio/speech/stream` — sentence-chunked streaming (length-prefixed framing)
 - ⚡ `/v1/audio/speech/pcm-stream` — **token-level** PCM streaming (~130 ms first chunk)
 - 🎭 `instruct=` parameter for emotion/style control (`"Excited and speak quickly."`, `"Whisper softly."`)
-- 🗣️ 9 built-in voices (`ryan`, `aiden`, `dylan`, `eric`, `serena`, `vivian`, `sohee`, `ono_anna`, `uncle_fu`)
+- 🗣️ **9 preset voices** (`ryan`, `aiden`, `dylan`, `eric`, `serena`, `vivian`, `sohee`, `ono_anna`, `uncle_fu`) lifted from the CustomVoice checkpoint and shipped as a ~37 KB sidecar bundle
+- 🧬 **Voice cloning** via `POST /v1/voices` — upload a reference clip, get back a persistent `vc_<id>` voice usable everywhere the preset names are
 - 🌍 Multilingual — English, French, German, Spanish, Italian, Portuguese, Japanese, Korean, Chinese
 - 🚦 Barge-in friendly — streams abort cleanly on client disconnect
 - 🐳 Docker/Podman — single-container deploy, Ubuntu 24.04, CUDA 12.8
@@ -281,8 +282,8 @@ Accepts **JSON body** or **query parameters**.
 | Param | Default | Notes |
 |---|---|---|
 | `input` / `text` | *(required)* | Text to synthesise. `input` preferred (OpenAI SDK compat). |
-| `model` | `tts-1` | Accepted for OpenAI compat; always uses Qwen3-TTS-CustomVoice. |
-| `voice` | `ryan` | Speaker name or OpenAI alias. See `GET /voices`. |
+| `model` | `tts-1` | Accepted for OpenAI compat; always uses the configured Qwen3-TTS checkpoint. |
+| `voice` | `ryan` | Preset name (`ryan`, `vivian`, …), OpenAI alias (`alloy`, `nova`, …), or a registered clone ID (`vc_ab12cd34`). See `GET /v1/voices`. |
 | `language` | `English` | `English`, `French`, `Chinese`, `German`, `Spanish`, … |
 | `instruct` | *(none)* | Style hint, e.g. `"Excited and speak quickly."` |
 | `response_format` | `mp3` | `mp3`, `wav`, or `opus` |
@@ -310,9 +311,61 @@ A zero-length frame marks end of stream.
 |---|---|---|
 | `chunk_size` | `4` | Codec frames per yield (lower = lower latency, more overhead) |
 
-### `GET /voices` — available speakers
+### `GET /v1/voices` — list all voices
 
-Returns all supported speaker names plus the OpenAI alias mapping.
+Returns preset speakers **and** user-registered clones, plus the OpenAI alias mapping:
+
+```json
+{
+  "data": [
+    {"id": "aiden", "kind": "preset", "name": "aiden", "gender": "m", "lang": "en,zh"},
+    {"id": "vivian", "kind": "preset", "name": "vivian", "gender": "f", "lang": "en,zh"},
+    {"id": "vc_ab12cd34", "kind": "custom", "name": "Alice", "created_at": 1734567890, "ref_text": "...", "x_vector_only_mode": false, "icl_mode": true}
+  ],
+  "openai_voice_aliases": {"alloy": "ryan", ...}
+}
+```
+
+`GET /voices` is kept as a deprecated alias that returns the same shape.
+
+### `POST /v1/voices` — register a voice clone
+
+Multipart form with an audio reference clip, returns the new voice record (201 Created).
+
+| Form field | Required | Notes |
+|---|---|---|
+| `name` | yes | Human-friendly label (any string). |
+| `audio` | yes | Reference clip. 3–30 s recommended. WAV/MP3/FLAC/OGG. |
+| `ref_text` | no | Transcript of the clip. When provided, enables full **in-context learning mode** (closer clone, prosody-aware). Without it, falls back to **x-vector-only** mode. |
+| `language` | no | Metadata only (e.g. `"English"`, `"French"`). |
+
+```bash
+# x-vector-only clone (no transcript needed)
+curl -X POST http://localhost:8001/v1/voices \
+    -F "name=Alice" \
+    -F "audio=@alice_sample.wav"
+# → {"id":"vc_ab12cd34","kind":"custom","name":"Alice",...}
+
+# Full ICL clone (prosody-aware)
+curl -X POST http://localhost:8001/v1/voices \
+    -F "name=Bob" \
+    -F "audio=@bob_sample.wav" \
+    -F "ref_text=The quick brown fox jumps over the lazy dog."
+
+# Use the clone like any other voice
+curl -X POST http://localhost:8001/v1/audio/speech \
+    -H 'Content-Type: application/json' \
+    -d '{"input":"Hello from my clone","voice":"vc_ab12cd34"}' \
+    --output clone_out.mp3
+```
+
+Clones persist to `$QWEN3_TTS_VOICES_DIR/custom/` (default `/data/voices/custom/`)
+as `<id>.safetensors` + `<id>.json` sidecars, ~13 KB total per clone.
+Mount that path as a volume so clones survive container restarts.
+
+### `DELETE /v1/voices/{voice_id}` — remove a clone
+
+Returns `200 {"id":"vc_...","deleted":true}` on success, `404` if unknown, `403` if the target is a preset (presets are immutable).
 
 ### `GET /health`, `GET /v1/models`
 
@@ -364,11 +417,15 @@ client = OpenAI(api_key="sk-mysecret", base_url="http://localhost:8001/v1")
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `QWEN3_TTS_MODEL_ID` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | Override the HF model |
-| `QWEN3_TTS_MAX_TEXT_LENGTH` | `10000` | Maximum input characters (returns HTTP 413 if exceeded) |
+| `QWEN3_TTS_MODEL_ID` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Override the HF model. Only `-Base` supports the clone path. |
+| `QWEN3_TTS_MAX_TEXT_LENGTH` | `10000` | Maximum input characters (returns HTTP 413 if exceeded). |
+| `QWEN3_TTS_MAX_REF_AUDIO_BYTES` | `10485760` | Maximum reference-audio upload size for `POST /v1/voices`. |
+| `QWEN3_TTS_VOICES_DIR` | `/data/voices` | Where user-registered clones persist. **Mount a volume here.** |
+| `QWEN3_TTS_PRESET_BUNDLE` | `assets/preset/bundle.safetensors` | Override preset bundle location. |
+| `QWEN3_TTS_DEFAULT_VOICE` | `ryan` | Default voice when the client omits `voice`. |
 | `HF_HOME` | `/root/.cache/huggingface` | Where weights are cached. **Mount a volume here.** |
-| `HF_TOKEN` | *(unset)* | HuggingFace token for gated downloads |
-| `QWEN_API_KEY` | *(unset)* | Require `Authorization: Bearer <key>` on `/v1/*` |
+| `HF_TOKEN` | *(unset)* | HuggingFace token for gated downloads. |
+| `QWEN_API_KEY` | *(unset)* | Require `Authorization: Bearer <key>` on `/v1/*`. |
 
 CLI flags:
 
@@ -454,7 +511,7 @@ For conversational use, a CUDA GPU with ≥ 6 GB VRAM is required.
 
 ## Acknowledgements
 
-- [Qwen team @ Alibaba](https://huggingface.co/Qwen) for the [Qwen3-TTS-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) model
+- [Qwen team @ Alibaba](https://huggingface.co/Qwen) for the [Qwen3-TTS-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) and [Qwen3-TTS-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) models. The preset-voice bundle in `assets/preset/` is derived from CustomVoice; provenance is documented in [discussion #45](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/discussions/45) and mirrored at [`malaiwah/qwen3-tts-preset-voices`](https://huggingface.co/datasets/malaiwah/qwen3-tts-preset-voices).
 - [`faster-qwen3-tts`](https://pypi.org/project/faster-qwen3-tts/) for CUDA-graph-accelerated inference
 - [`qwen-tts`](https://pypi.org/project/qwen-tts/) for the reference inference path
 

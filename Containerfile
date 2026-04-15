@@ -1,4 +1,4 @@
-# Qwen3-TTS CustomVoice server
+# Qwen3-TTS server (Qwen3-TTS-12Hz-1.7B-Base + voice-clone path)
 #
 # Base: CUDA 12.8 + Ubuntu 24.04
 #   - PyTorch cu128 wheels are pre-built → CI builds in < 5 min (no GPU needed)
@@ -37,8 +37,13 @@ RUN pip install --no-cache-dir torch torchvision torchaudio \
 
 # TTS inference + serving stack
 # faster-qwen3-tts: tier-1 CUDA-graph-accelerated backend (~3.4x RT)
-# qwen-tts: reference backend (tier 2/3 fallback, also a dep of faster-qwen3-tts)
-RUN pip install --no-cache-dir faster-qwen3-tts qwen-tts soundfile fastapi uvicorn prometheus-client
+# qwen-tts:         reference backend (tier 2/3 fallback, also a dep of faster-qwen3-tts)
+# safetensors:      loads the preset-voice bundle + persisted clone sidecars
+# python-multipart: required by FastAPI for /v1/voices file uploads
+RUN pip install --no-cache-dir \
+        faster-qwen3-tts qwen-tts \
+        soundfile fastapi uvicorn prometheus-client \
+        safetensors python-multipart
 
 # Flash Attention 2 (optional — tier-2 speedup for the qwen_tts fallback path).
 # Only installs a pre-built binary wheel; never compiles from source so CI stays fast.
@@ -53,7 +58,15 @@ RUN pip install --no-cache-dir --only-binary :all: flash-attn \
 ENV HF_HOME=/root/.cache/huggingface
 VOLUME ["/root/.cache/huggingface"]
 
+# Persistent storage for user-registered voice clones (POST /v1/voices).
+# Mount a volume here to keep clones across container restarts.  The preset
+# voices are baked into the image under /app/assets and do not need this.
+ENV QWEN3_TTS_VOICES_DIR=/data/voices
+VOLUME ["/data/voices"]
+
 COPY server.py /app/server.py
+COPY voice_registry.py /app/voice_registry.py
+COPY assets/ /app/assets/
 
 EXPOSE 8001
 

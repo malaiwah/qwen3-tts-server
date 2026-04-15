@@ -1,6 +1,20 @@
-"""Qwen3-TTS CustomVoice server — OpenAI-compatible /v1/audio/speech endpoint.
+"""Qwen3-TTS server — OpenAI-compatible /v1/audio/speech with voice cloning.
 
-Serves Qwen3-TTS-12Hz-1.7B-CustomVoice with:
+Serves Qwen3-TTS-12Hz-1.7B-**Base** with a unified voice-cloning path that
+handles both preset speakers and user-registered clones:
+
+- **Preset voices** — nine named speakers (aiden, dylan, eric, ono_anna,
+  ryan, serena, sohee, uncle_fu, vivian) lifted from the CustomVoice
+  checkpoint's ``codec_embedding`` and shipped as a ~37 KB sidecar bundle.
+  No CustomVoice checkpoint download needed.  Provenance documented at
+  ``assets/preset/bundle.json`` and on HF:
+  https://huggingface.co/datasets/malaiwah/qwen3-tts-preset-voices
+- **Custom clones** — ``POST /v1/voices`` with a reference audio clip
+  creates a persistent clone (`vc_<8hex>` ID) usable via the same ``voice``
+  parameter.  Optional ``ref_text`` enables full in-context learning mode;
+  without it we fall back to x-vector-only mode.
+
+Other features:
 
 - Flash Attention 2 for faster GPU inference (optional, auto-detected)
 - Optional CUDA-graph acceleration via ``faster-qwen3-tts`` (~5× speedup vs CPU)
@@ -36,22 +50,42 @@ import struct
 import subprocess
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator, Optional
 
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+from voice_registry import KIND_CUSTOM, KIND_PRESET, VoiceRegistry
 
 
 # -----------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------
 
-MODEL_ID = os.getenv("QWEN3_TTS_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+MODEL_ID = os.getenv("QWEN3_TTS_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 MAX_TEXT_LENGTH = int(os.getenv("QWEN3_TTS_MAX_TEXT_LENGTH", "10000"))
+
+# Upper bound on reference audio upload size (bytes).  10 MB comfortably
+# covers a 60 s 16-bit 48 kHz mono WAV clip plus headers.
+MAX_REF_AUDIO_BYTES = int(os.getenv("QWEN3_TTS_MAX_REF_AUDIO_BYTES", str(10 * 1024 * 1024)))
+
+# Voice registry layout.  Presets ship in the repo as a ~37 KB bundle;
+# custom clones persist in a writable volume (typically a Docker volume
+# mounted at /data).
+_REPO_ROOT = Path(__file__).resolve().parent
+PRESET_BUNDLE_PATH = Path(
+    os.getenv("QWEN3_TTS_PRESET_BUNDLE", str(_REPO_ROOT / "assets" / "preset" / "bundle.safetensors"))
+)
+PRESET_META_PATH = Path(
+    os.getenv("QWEN3_TTS_PRESET_META", str(_REPO_ROOT / "assets" / "preset" / "bundle.json"))
+)
+VOICES_DIR = Path(os.getenv("QWEN3_TTS_VOICES_DIR", "/data/voices"))
+CUSTOM_VOICES_DIR = VOICES_DIR / "custom"
 
 # Optional bearer-token auth.  Empty/None disables auth entirely.
 _API_KEY: str = os.getenv("QWEN_API_KEY", "") or ""
@@ -62,8 +96,9 @@ _AUTH_EXEMPT_PATHS = frozenset({
     "/docs", "/redoc", "/openapi.json",
 })
 
-# OpenAI voice aliases → Qwen3 speaker names
-# Unknown voices are passed through unchanged (allows custom speakers).
+# OpenAI voice aliases → preset voice IDs (the nine speakers lifted from
+# CustomVoice).  Unknown voices are looked up directly in the registry — so
+# ``voice="vc_deadbeef"`` or ``voice="my_custom"`` flow through unchanged.
 _VOICE_MAP: dict[str, str] = {
     "alloy": "ryan",
     "echo": "aiden",
@@ -72,6 +107,10 @@ _VOICE_MAP: dict[str, str] = {
     "nova": "serena",
     "shimmer": "vivian",
 }
+
+# Default voice when the client omits one — must match a preset or an ID
+# present in the registry at startup.
+_DEFAULT_VOICE = os.getenv("QWEN3_TTS_DEFAULT_VOICE", "ryan")
 
 # Sentence boundary pattern — split on .!? followed by whitespace.
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
@@ -134,6 +173,16 @@ _FASTER_TTS = False
 _DEVICE = "cuda"
 _INFER_SEM: asyncio.Semaphore  # initialized in lifespan
 
+# Voice registry — constructed at import time so the module is always
+# importable (tests use this), populated during lifespan startup.
+_voice_registry = VoiceRegistry(
+    preset_bundle_path=PRESET_BUNDLE_PATH,
+    preset_meta_path=PRESET_META_PATH,
+    custom_dir=CUSTOM_VOICES_DIR,
+    device=_DEVICE,
+    dtype=torch.bfloat16,
+)
+
 
 def _load_model_sync(device: str, prefer_faster: bool) -> None:
     """Synchronous model loader — runs in a background thread via asyncio.to_thread."""
@@ -161,24 +210,48 @@ def _load_model_sync(device: str, prefer_faster: bool) -> None:
 
     logger.info("Model loaded in %.1fs via %s", time.time() - start, backend_desc)
 
+    # Load voice registry now that the model is up — presets and any
+    # previously-registered custom clones need the model device/dtype.
+    _voice_registry.device = device
+    _voice_registry.bind_model(model_obj)
+    _voice_registry.load()
+
     # Warmup — capture CUDA graphs / JIT-compile kernels so the first real
-    # request doesn't pay a 5–10 s setup penalty.
+    # request doesn't pay a 5–10 s setup penalty.  Warms up through the
+    # same clone path we use in production.
     if device == "cuda":
         logger.info("Warming up CUDA graphs …")
         warmup_start = time.time()
+        warmup_record = _voice_registry.get(_DEFAULT_VOICE)
+        if warmup_record is None:
+            presets = _voice_registry.list(kind=KIND_PRESET)
+            if presets:
+                warmup_record = _voice_registry.get(presets[0]["id"])
         try:
-            warmup_kwargs = {"text": "Warmup.", "language": "English", "speaker": "ryan"}
-            model_obj.generate_custom_voice(**warmup_kwargs)
-            if _FASTER_TTS and hasattr(model_obj, "generate_custom_voice_streaming"):
-                for _ in model_obj.generate_custom_voice_streaming(**warmup_kwargs, chunk_size=4):
-                    pass
-            logger.info("CUDA graph warmup done in %.1fs", time.time() - warmup_start)
+            if warmup_record is None:
+                logger.warning("No preset voices loaded — skipping warmup.")
+            else:
+                warmup_kwargs = {
+                    "text": "Warmup.",
+                    "language": "English",
+                    "voice_clone_prompt": [warmup_record.prompt_item],
+                }
+                model_obj.generate_voice_clone(**warmup_kwargs)
+                if _FASTER_TTS and hasattr(model_obj, "generate_voice_clone_streaming"):
+                    for _ in model_obj.generate_voice_clone_streaming(**warmup_kwargs, chunk_size=4):
+                        pass
+                logger.info("CUDA graph warmup done in %.1fs", time.time() - warmup_start)
         except Exception as exc:  # noqa: BLE001
             logger.warning("CUDA graph warmup failed (non-fatal): %s", exc)
 
     _model = model_obj
     _model_ready = True
-    logger.info("✓ Server ready — backend: %s", backend_desc)
+    logger.info(
+        "✓ Server ready — backend: %s — voices: %d preset, %d custom",
+        backend_desc,
+        len(_voice_registry.list(kind=KIND_PRESET)),
+        len(_voice_registry.list(kind=KIND_CUSTOM)),
+    )
 
 
 # -----------------------------------------------------------------------
@@ -255,7 +328,7 @@ async def lifespan(app: FastAPI):
         torch.cuda.empty_cache()
 
 
-app = FastAPI(title="Qwen3-TTS CustomVoice", lifespan=lifespan)
+app = FastAPI(title="Qwen3-TTS", lifespan=lifespan)
 
 
 # -----------------------------------------------------------------------
@@ -349,20 +422,51 @@ async def _parse_params(request: Request, **query_defaults) -> dict:
 
 
 def _resolve_voice(voice: str) -> str:
-    """Map OpenAI voice names to Qwen3 speaker names; pass others through."""
-    return _VOICE_MAP.get(voice.lower(), voice)
+    """Resolve a user-supplied voice string to a registry ID.
+
+    Tries in order:
+      1. exact match on a registered voice ID (preset name or ``vc_<hex>``)
+      2. OpenAI alias (alloy, echo, …) → preset name
+      3. lowercased exact match (tolerate case)
+
+    Raises HTTPException(400) if no resolution is found.
+    """
+    if voice in _voice_registry:
+        return voice
+    mapped = _VOICE_MAP.get(voice.lower())
+    if mapped and mapped in _voice_registry:
+        return mapped
+    if voice.lower() in _voice_registry:
+        return voice.lower()
+    known = sorted([v["id"] for v in _voice_registry.list()])
+    raise HTTPException(
+        400,
+        f"Unknown voice '{voice}'. Known voices: {known}. "
+        "Register a new clone via POST /v1/voices.",
+    )
 
 
 # -----------------------------------------------------------------------
 # Core synthesis helpers
 # -----------------------------------------------------------------------
 
-def _generate_audio_sync(text: str, voice: str, instruct: str | None, language: str) -> tuple:
-    """Synchronous TTS generation — call via asyncio.to_thread."""
-    kwargs: dict = {"text": text, "language": language or "English", "speaker": voice}
+def _generate_audio_sync(text: str, voice_id: str, instruct: str | None, language: str) -> tuple:
+    """Synchronous TTS generation — call via asyncio.to_thread.
+
+    ``voice_id`` must already have been resolved through :func:`_resolve_voice`.
+    """
+    record = _voice_registry.get(voice_id)
+    if record is None:
+        # Shouldn't happen if _resolve_voice was used, but guard defensively.
+        raise HTTPException(400, f"Unknown voice '{voice_id}'.")
+    kwargs: dict = {
+        "text": text,
+        "language": language or "English",
+        "voice_clone_prompt": [record.prompt_item],
+    }
     if instruct:
         kwargs["instruct"] = instruct
-    wavs, sr = _model.generate_custom_voice(**kwargs)
+    wavs, sr = _model.generate_voice_clone(**kwargs)
     return wavs[0], sr
 
 
@@ -587,18 +691,22 @@ async def speech_pcm_stream(
             loop = asyncio.get_running_loop()
             queue: asyncio.Queue = asyncio.Queue()
 
+            record = _voice_registry.get(voice_in)
+            if record is None:
+                raise HTTPException(400, f"Unknown voice '{voice_in}'.")
+
             def _stream_in_thread() -> None:
                 """Run the synchronous CUDA-graph generator in a thread, post chunks to queue."""
                 try:
                     kwargs: dict = {
                         "text": text_in,
-                        "speaker": voice_in,
+                        "voice_clone_prompt": [record.prompt_item],
                         "language": p["language"] or "English",
                         "chunk_size": chunk_size,
                     }
                     if p.get("instruct"):
                         kwargs["instruct"] = p["instruct"]
-                    for item in _model.generate_custom_voice_streaming(**kwargs):
+                    for item in _model.generate_voice_clone_streaming(**kwargs):
                         loop.call_soon_threadsafe(queue.put_nowait, item)
                 except Exception as exc:  # noqa: BLE001
                     loop.call_soon_threadsafe(queue.put_nowait, exc)
@@ -661,18 +769,116 @@ async def health():
         "model_id": MODEL_ID,
         "backend": backend,
         "device": _DEVICE,
+        "voices": {
+            "preset": len(_voice_registry.list(kind=KIND_PRESET)),
+            "custom": len(_voice_registry.list(kind=KIND_CUSTOM)),
+        },
     }
 
 
 @app.get("/voices")
-async def voices():
-    """List available speaker voices plus OpenAI voice alias mapping."""
-    speakers = _model.get_supported_speakers() if _model_ready else []
+async def voices_legacy():
+    """Legacy voices endpoint — kept for backward compatibility.
+
+    New callers should prefer ``GET /v1/voices``.
+    """
+    return await list_voices()
+
+
+@app.get("/v1/voices")
+async def list_voices():
+    """List all voices — presets and user-registered clones — plus aliases.
+
+    Response shape::
+
+        {
+          "data": [
+            {"id": "aiden", "kind": "preset", "name": "aiden", "gender": "m", "lang": "en,zh"},
+            {"id": "vc_ab12cd34", "kind": "custom", "name": "Alice", "created_at": 1734567890, …},
+            ...
+          ],
+          "openai_voice_aliases": {"alloy": "ryan", …}
+        }
+    """
     return {
-        "speakers": speakers,
+        "data": _voice_registry.list(),
         "openai_voice_aliases": _VOICE_MAP,
-        "note": "OpenAI voices (alloy, echo, fable, onyx, nova, shimmer) are accepted and mapped automatically.",
+        "note": (
+            "OpenAI voices (alloy, echo, fable, onyx, nova, shimmer) are accepted "
+            "and mapped automatically to preset speakers. Register custom clones "
+            "via POST /v1/voices."
+        ),
     }
+
+
+@app.post("/v1/voices")
+async def register_voice(
+    name: str = Form(..., description="Human-friendly label for the voice."),
+    audio: UploadFile = File(..., description="Reference audio clip (WAV/MP3/FLAC/OGG). 3–30 s recommended."),
+    ref_text: Optional[str] = Form(
+        None,
+        description="Optional transcript of the reference audio. When provided, enables full in-context learning mode (closer clone, prosody-aware).",
+    ),
+    language: Optional[str] = Form(None, description="Language hint, e.g. 'English' (metadata only)."),
+):
+    """Register a new custom voice from a reference audio clip.
+
+    Returns the voice record (including the assigned ``id``, e.g.
+    ``vc_ab12cd34``) which can then be used as the ``voice`` parameter on
+    ``/v1/audio/speech`` and its streaming variants.
+    """
+    if not _model_ready:
+        raise HTTPException(503, "Model is still loading. Check /health and retry.")
+    if not name.strip():
+        raise HTTPException(400, "name is required")
+
+    data = await audio.read()
+    if not data:
+        raise HTTPException(400, "audio file is empty")
+    if len(data) > MAX_REF_AUDIO_BYTES:
+        raise HTTPException(
+            413,
+            f"audio file exceeds {MAX_REF_AUDIO_BYTES} bytes. "
+            "Trim to under ~30 s or increase QWEN3_TTS_MAX_REF_AUDIO_BYTES.",
+        )
+
+    suffix = Path(audio.filename or "").suffix.lower() or ".wav"
+    if suffix not in (".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a"):
+        logger.info("Unusual audio suffix %r — soundfile/ffmpeg will attempt decode.", suffix)
+
+    # Clone-prompt creation runs a model forward (ECAPA + optional tokeniser)
+    # on the GPU, so acquire the inference semaphore.
+    async with _INFER_SEM:
+        try:
+            record = await asyncio.to_thread(
+                _voice_registry.register,
+                name=name,
+                ref_audio_bytes=data,
+                ref_audio_suffix=suffix,
+                ref_text=ref_text,
+                language=language,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            # create_voice_clone_prompt is the most likely failure mode
+            # (unsupported audio, ref_text mismatch).  Surface as 422.
+            logger.exception("register_voice failed")
+            raise HTTPException(422, f"could not create clone prompt: {exc}") from exc
+
+    return JSONResponse(status_code=201, content=record.summary())
+
+
+@app.delete("/v1/voices/{voice_id}")
+async def delete_voice(voice_id: str):
+    """Delete a registered custom voice.  Presets cannot be deleted."""
+    try:
+        removed = _voice_registry.delete(voice_id)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    if not removed:
+        raise HTTPException(404, f"voice '{voice_id}' not found")
+    return {"id": voice_id, "deleted": True}
 
 
 @app.get("/v1/models")
@@ -721,7 +927,7 @@ async def get_model(model_id: str):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Qwen3-TTS CustomVoice server",
+        description="Qwen3-TTS server (voice cloning on Qwen3-TTS-12Hz-1.7B-Base)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Performance tiers (GPU, fastest first):
